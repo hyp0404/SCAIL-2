@@ -12,15 +12,20 @@ published workflow.
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import json
 import mimetypes
 import os
+import re
 import shutil
+import socket
 import subprocess
 import time
 import uuid
+from fractions import Fraction
 from pathlib import Path
 from typing import Annotated, Any
+from urllib.parse import unquote, urljoin, urlparse
 
 import httpx
 from fastmcp import FastMCP
@@ -40,6 +45,22 @@ MAX_DOWNLOAD_MB = int(os.getenv("MAX_DOWNLOAD_MB", "2048"))
 NODE_CACHE_TTL_SECONDS = int(os.getenv("NODE_CACHE_TTL_SECONDS", "3600"))
 ALLOW_CONCURRENT_PIPELINES = os.getenv("ALLOW_CONCURRENT_PIPELINES", "false").lower() == "true"
 KEEP_INTERMEDIATE_FILES = os.getenv("KEEP_INTERMEDIATE_FILES", "false").lower() == "true"
+BERNINI_FRAME_MULTIPLE = max(1, int(os.getenv("BERNINI_FRAME_MULTIPLE", "4")))
+BERNINI_FRAME_OFFSET = int(os.getenv("BERNINI_FRAME_OFFSET", "1"))
+BERNINI_MAX_FRAMES = max(1, int(os.getenv("BERNINI_MAX_FRAMES", "4097")))
+
+IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp"}
+VIDEO_SUFFIXES = {".mp4", ".mov", ".mkv", ".avi", ".webm"}
+CONTENT_TYPE_SUFFIXES = {
+    "image/jpeg": ".jpg",
+    "image/png": ".png",
+    "image/webp": ".webp",
+    "video/mp4": ".mp4",
+    "video/quicktime": ".mov",
+    "video/x-matroska": ".mkv",
+    "video/x-msvideo": ".avi",
+    "video/webm": ".webm",
+}
 
 if not DATA_DIR.parent.exists():
     DATA_DIR = Path("./data")
@@ -91,6 +112,16 @@ def _headers() -> dict[str, str]:
 def _client() -> httpx.AsyncClient:
     timeout = httpx.Timeout(connect=30.0, read=300.0, write=300.0, pool=30.0)
     return httpx.AsyncClient(timeout=timeout, follow_redirects=True, headers=_headers())
+
+
+def _public_client(*, follow_redirects: bool = False) -> httpx.AsyncClient:
+    """HTTP client for untrusted media URLs; never forwards the RunningHub key."""
+    timeout = httpx.Timeout(connect=30.0, read=300.0, write=300.0, pool=30.0)
+    return httpx.AsyncClient(
+        timeout=timeout,
+        follow_redirects=follow_redirects,
+        headers={"Accept": "*/*", "User-Agent": "runninghub-person-background-mcp/1.1"},
+    )
 
 
 def _unwrap_response(payload: dict[str, Any]) -> dict[str, Any]:
@@ -154,6 +185,10 @@ def _is_type(node: dict[str, Any], kind: str) -> bool:
             or "STRING" in field_type
             or "prompt" in text
         )
+    if kind == "integer":
+        return field_type in {"INT", "INTEGER", "NUMBER"} or field_name in {
+            "value", "frames", "frame_count", "num_frames"
+        }
     return False
 
 
@@ -268,6 +303,14 @@ def _resolve_stage2(nodes: list[dict[str, Any]]) -> dict[str, dict[str, Any] | N
             positive=["提示", "prompt", "替换要求", "描述", "text"],
             required=False,
         ),
+        "frame_count": _resolve_node(
+            nodes,
+            kind="integer",
+            env_prefix="BERNINI_FRAME_COUNT",
+            positive=["视频总帧数", "总帧数", "frame count", "num frames", "frames"],
+            negative=["人数", "person", "seed", "width", "height"],
+            required=False,
+        ),
     }
 
 
@@ -301,6 +344,109 @@ def _validate_local_file(path_text: str, allowed_suffixes: set[str]) -> Path:
     if path.stat().st_size > MAX_UPLOAD_MB * 1024 * 1024:
         raise ValueError(f"File exceeds MAX_UPLOAD_MB={MAX_UPLOAD_MB}: {path.name}")
     return path
+
+
+async def _validate_public_https_url(url: str) -> None:
+    parsed = urlparse(url)
+    if parsed.scheme.lower() != "https" or not parsed.hostname:
+        raise ValueError("Remote media input must be an HTTPS URL")
+    if parsed.username or parsed.password:
+        raise ValueError("Remote media URL must not contain embedded credentials")
+    try:
+        addresses = await asyncio.get_running_loop().getaddrinfo(
+            parsed.hostname,
+            parsed.port or 443,
+            type=socket.SOCK_STREAM,
+        )
+    except socket.gaierror as exc:
+        raise ValueError(f"Unable to resolve remote media host: {parsed.hostname}") from exc
+    if not addresses:
+        raise ValueError(f"Unable to resolve remote media host: {parsed.hostname}")
+    for address in addresses:
+        ip = ipaddress.ip_address(address[4][0])
+        if not ip.is_global:
+            raise ValueError(f"Remote media host resolves to a non-public address: {ip}")
+
+
+def _remote_suffix(response: httpx.Response, url: str, allowed_suffixes: set[str]) -> str:
+    disposition = response.headers.get("content-disposition", "")
+    match = re.search(r"filename\*=UTF-8''([^;]+)|filename=\"?([^\";]+)", disposition, re.I)
+    names = []
+    if match:
+        names.append(unquote(match.group(1) or match.group(2) or ""))
+    names.append(unquote(Path(urlparse(url).path).name))
+    for name in names:
+        suffix = Path(name).suffix.lower()
+        if suffix in allowed_suffixes:
+            return suffix
+    content_type = response.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+    suffix = CONTENT_TYPE_SUFFIXES.get(content_type, "")
+    if suffix in allowed_suffixes:
+        return suffix
+    if content_type.startswith("text/") or content_type in {"application/json", "application/xml"}:
+        raise ValueError(f"Remote URL returned {content_type}, not a supported media file")
+    return ".jpg" if allowed_suffixes == IMAGE_SUFFIXES else ".mp4"
+
+
+async def _download_external_input(
+    url: str,
+    destination_stem: Path,
+    allowed_suffixes: set[str],
+) -> Path:
+    current_url = url.strip()
+    async with _public_client() as client:
+        for _ in range(6):
+            await _validate_public_https_url(current_url)
+            request = client.build_request("GET", current_url)
+            response = await client.send(request, stream=True)
+            if response.is_redirect:
+                location = response.headers.get("location")
+                await response.aclose()
+                if not location:
+                    raise ValueError("Remote media redirect did not include a location")
+                current_url = urljoin(current_url, location)
+                continue
+            try:
+                response.raise_for_status()
+                declared_size = int(response.headers.get("content-length") or 0)
+                maximum = MAX_UPLOAD_MB * 1024 * 1024
+                if declared_size > maximum:
+                    raise ValueError(f"Remote file exceeds MAX_UPLOAD_MB={MAX_UPLOAD_MB}")
+                suffix = _remote_suffix(response, current_url, allowed_suffixes)
+                destination = destination_stem.with_suffix(suffix)
+                temporary = destination.with_suffix(destination.suffix + ".part")
+                total = 0
+                try:
+                    with temporary.open("wb") as handle:
+                        async for chunk in response.aiter_bytes(1024 * 1024):
+                            total += len(chunk)
+                            if total > maximum:
+                                raise ValueError(f"Remote file exceeds MAX_UPLOAD_MB={MAX_UPLOAD_MB}")
+                            handle.write(chunk)
+                    if total == 0:
+                        raise ValueError("Remote media file is empty")
+                    temporary.replace(destination)
+                except Exception:
+                    temporary.unlink(missing_ok=True)
+                    raise
+                return destination
+            finally:
+                await response.aclose()
+    raise ValueError("Remote media URL exceeded the redirect limit")
+
+
+async def _ingest_input(
+    value: str,
+    destination_stem: Path,
+    allowed_suffixes: set[str],
+) -> Path:
+    if value.strip().lower().startswith(("https://", "http://")):
+        return await _download_external_input(value, destination_stem, allowed_suffixes)
+    source = _validate_local_file(value, allowed_suffixes)
+    destination = destination_stem.with_suffix(source.suffix.lower())
+    if source != destination:
+        await asyncio.to_thread(shutil.copy2, source, destination)
+    return destination
 
 
 async def _upload_file(path: Path) -> dict[str, Any]:
@@ -390,7 +536,7 @@ async def _download(url: str, destination: Path) -> Path:
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = destination.with_suffix(destination.suffix + ".part")
     total = 0
-    async with _client() as client:
+    async with _public_client(follow_redirects=True) as client:
         async with client.stream("GET", url) as response:
             response.raise_for_status()
             with temporary.open("wb") as handle:
@@ -437,7 +583,7 @@ def _state_for_user(state: dict[str, Any]) -> dict[str, Any]:
         "pipeline_id", "status", "stage", "created_at", "updated_at",
         "stage1_task_id", "stage2_task_id", "stage1_results", "stage2_results",
         "final_video_url", "final_runninghub_upload_url", "warning", "error",
-        "preserve_original_audio_and_duration",
+        "preserve_original_audio_and_duration", "source_video_info", "bernini_frame_count",
     }
     result = {key: value for key, value in state.items() if key in keep and value not in (None, "", [])}
     if state.get("status") in {"stage1_running", "stage2_running"}:
@@ -451,21 +597,58 @@ def _active_pipeline() -> dict[str, Any] | None:
             state = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             continue
-        if state.get("status") in {"stage1_running", "stage2_running", "stage2_preparing"}:
+        if state.get("status") in {
+            "receiving_inputs", "uploading", "stage1_running", "stage2_running", "stage2_preparing"
+        }:
             return state
     return None
 
 
 def _ffprobe_duration(path: Path) -> float:
-    command = [
-        "ffprobe", "-v", "error", "-show_entries", "format=duration",
-        "-of", "default=noprint_wrappers=1:nokey=1", str(path),
-    ]
-    output = subprocess.check_output(command, text=True, timeout=30).strip()
-    duration = float(output)
+    duration = float(_ffprobe_video_info(path)["duration_seconds"])
     if duration <= 0:
         raise ValueError("Source video has no positive duration")
     return duration
+
+
+def _ffprobe_video_info(path: Path) -> dict[str, Any]:
+    command = [
+        "ffprobe", "-v", "error", "-select_streams", "v:0",
+        "-show_entries", "stream=avg_frame_rate,r_frame_rate,nb_frames,duration:format=duration",
+        "-of", "json", str(path),
+    ]
+    payload = json.loads(subprocess.check_output(command, text=True, timeout=30))
+    streams = payload.get("streams") or []
+    if not streams:
+        raise ValueError("Source file contains no video stream")
+    stream = streams[0]
+    duration = float(stream.get("duration") or payload.get("format", {}).get("duration") or 0)
+    rate_text = str(stream.get("avg_frame_rate") or stream.get("r_frame_rate") or "0/1")
+    try:
+        fps = float(Fraction(rate_text))
+    except (ValueError, ZeroDivisionError):
+        fps = 0.0
+    raw_frames = stream.get("nb_frames")
+    frame_count = int(raw_frames) if str(raw_frames or "").isdigit() else round(duration * fps)
+    if duration <= 0 or fps <= 0 or frame_count <= 0:
+        raise ValueError(
+            f"Unable to determine video timing: duration={duration}, fps={fps}, frames={frame_count}"
+        )
+    return {
+        "duration_seconds": duration,
+        "fps": fps,
+        "frame_count": frame_count,
+    }
+
+
+def _bernini_frame_count(source_frame_count: int) -> int:
+    capped = min(max(1, source_frame_count), BERNINI_MAX_FRAMES)
+    if BERNINI_FRAME_MULTIPLE == 1:
+        return capped
+    candidate = capped - ((capped - BERNINI_FRAME_OFFSET) % BERNINI_FRAME_MULTIPLE)
+    if candidate <= 0:
+        candidate = min(capped, max(1, BERNINI_FRAME_OFFSET))
+    return candidate
 
 
 def _restore_audio_and_duration(raw_video: Path, source_video: Path, output: Path) -> None:
@@ -492,7 +675,7 @@ async def _finalize_stage2(state: dict[str, Any], videos: list[dict[str, Any]]) 
         return state
 
     pipeline_dir = _pipeline_dir(state["pipeline_id"])
-    source_video = pipeline_dir / "source_original.mp4"
+    source_video = pipeline_dir / str(state.get("source_original_name", "source_original.mp4"))
     raw_video = pipeline_dir / "stage2_raw.mp4"
     final_video = pipeline_dir / "final.mp4"
     try:
@@ -556,6 +739,10 @@ async def _advance_pipeline(state: dict[str, Any]) -> dict[str, Any]:
             ]
             if mapping["prompt"] is not None:
                 overrides.append(_override(mapping["prompt"], state["stage2_prompt"]))
+            if mapping["frame_count"] is not None and state.get("bernini_frame_count") is not None:
+                overrides.append(
+                    _override(mapping["frame_count"], str(state["bernini_frame_count"]))
+                )
             submitted = await _submit_app(BERNINI_WEBAPP_ID, overrides)
             state.update(
                 status="stage2_running",
@@ -645,23 +832,24 @@ async def inspect_person_background_pipeline(force_refresh: bool = False) -> dic
 
 @mcp.tool(
     description=(
-        "直接使用 ChatGPT 的人物参考图、原视频和干净背景图启动两阶段替换任务。"
+        "使用人物参考图、原视频和背景图启动两阶段替换任务。三个媒体参数应传入 Railway "
+        "可访问的 HTTPS 临时下载地址，也兼容已经位于 Railway 容器内的绝对路径。"
         "第一阶段 SCAIL 换人，成功后自动由 Bernini-R 换背景；会消耗两次 RunningHub RH，"
-        "必须显式确认 confirm_rh_charge=true。"
+        "必须显式确认 confirm_rh_charge=true。服务器会自动读取原视频帧数并设置 Bernini 总帧数。"
     )
 )
 async def submit_person_background_replacement_from_chatgpt_attachments(
     reference_person_image_file: Annotated[
         str,
-        Field(description="ChatGPT 人物参考图片附件的绝对本地路径", json_schema_extra={"x-openai-file": True}),
+        Field(description="人物参考图的 HTTPS 临时下载地址，或 Railway 容器内绝对路径"),
     ],
     source_video_file: Annotated[
         str,
-        Field(description="ChatGPT 原始动作视频附件的绝对本地路径", json_schema_extra={"x-openai-file": True}),
+        Field(description="原始动作视频的 HTTPS 临时下载地址，或 Railway 容器内绝对路径"),
     ],
     background_image_file: Annotated[
         str,
-        Field(description="ChatGPT 干净背景图片附件的绝对本地路径", json_schema_extra={"x-openai-file": True}),
+        Field(description="背景参考图的 HTTPS 临时下载地址，或 Railway 容器内绝对路径"),
     ],
     confirm_rh_charge: Annotated[
         bool,
@@ -683,17 +871,11 @@ async def submit_person_background_replacement_from_chatgpt_attachments(
                 "Finish/query it before starting another, or set ALLOW_CONCURRENT_PIPELINES=true."
             )
 
-    person = _validate_local_file(reference_person_image_file, {".jpg", ".jpeg", ".png", ".webp"})
-    source = _validate_local_file(source_video_file, {".mp4", ".mov", ".mkv", ".avi", ".webm"})
-    background = _validate_local_file(background_image_file, {".jpg", ".jpeg", ".png", ".webp"})
-
     pipeline_id = str(uuid.uuid4())
     pipeline_dir = _pipeline_dir(pipeline_id)
-    source_copy = pipeline_dir / "source_original.mp4"
-    shutil.copy2(source, source_copy)
     state: dict[str, Any] = {
         "pipeline_id": pipeline_id,
-        "status": "uploading",
+        "status": "receiving_inputs",
         "stage": 1,
         "created_at": time.time(),
         "updated_at": time.time(),
@@ -705,6 +887,20 @@ async def submit_person_background_replacement_from_chatgpt_attachments(
     _save_state(state)
 
     try:
+        person, source, background = await asyncio.gather(
+            _ingest_input(reference_person_image_file, pipeline_dir / "person_reference", IMAGE_SUFFIXES),
+            _ingest_input(source_video_file, pipeline_dir / "source_original", VIDEO_SUFFIXES),
+            _ingest_input(background_image_file, pipeline_dir / "background_reference", IMAGE_SUFFIXES),
+        )
+        source_info = await asyncio.to_thread(_ffprobe_video_info, source)
+        frame_count = _bernini_frame_count(int(source_info["frame_count"]))
+        state.update(
+            status="uploading",
+            source_original_name=source.name,
+            source_video_info=source_info,
+            bernini_frame_count=frame_count,
+        )
+        _save_state(state)
         person_upload, source_upload, background_upload = await asyncio.gather(
             _upload_file(person), _upload_file(source), _upload_file(background)
         )
