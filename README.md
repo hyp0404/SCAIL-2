@@ -1,242 +1,244 @@
-# SCAIL-2 RunningHub MCP（Railway 部署版）
+# RunningHub 换人 + 换背景 MCP
 
-这是一个可直接上传到 GitHub、再由 Railway 部署的远程 MCP 服务。它不会在 Railway 上运行 SCAIL-2 大模型；Railway 只负责接收 ChatGPT 请求、下载附件、上传到 RunningHub、提交任务并查询结果。GPU 推理由 RunningHub 完成，生成费用从你的 RunningHub 账户扣 RH 币。
+这是一个可部署到 Railway 并连接 ChatGPT 的双阶段 RunningHub MCP：
 
-默认接入的应用：
+1. **SCAIL-2 单人人物替换**：使用人物参考图替换原视频人物，保留动作与机位。
+2. **Bernini-R 参考背景替换**：使用背景图片替换第一阶段视频的环境。
+3. **本地收尾**（默认开启）：恢复原视频音频，并把最终时长严格裁切/补帧到原视频时长。
 
-- 名称：SCAIL-2 影视级角色动作驱动与替换
-- RunningHub 应用 ID：`2064610888811900929`
-- 页面：<https://www.runninghub.cn/ai-detail/2064610888811900929>
+两个生成阶段都会消耗 RunningHub RH。提交工具要求 `confirm_rh_charge=true`，不会在未确认时扣费。
 
-## 功能
+## 使用的 RunningHub 应用
 
-- `inspect_scail_app`：只读检查应用和输入节点，不创建任务。
-- `submit_scail_replacement`：参考人物图片 + 原视频 → 完整人物替换视频。
-- `get_scail_task`：查询状态、视频结果 URL、RH 消耗。
-- `wait_scail_task`：最长等待 15 分钟，超时不会取消 RunningHub 任务。
-- 自动调用 RunningHub 最新二进制媒体上传接口。
-- 自动读取 AI 应用 API 示例，不把图片、视频节点编号写死。
-- 支持 ChatGPT 附件产生的临时下载 URL。
-- 每次创建任务必须显式设置 `confirm_rh_charge=true`，防止误扣 RH。
+| 阶段 | 应用 | 默认 WebApp ID |
+| --- | --- | --- |
+| 换人 | SCAIL-2 单人人物替换 | `2067490689415471105` |
+| 换背景 | Bernini-R 参考背景视频替换流程 | `2062558412986216449` |
 
-## 一、准备 RunningHub
+项目不会把节点编号写死。服务器启动后会从 RunningHub 获取最新 `nodeInfoList`，按字段类型、节点名称和描述自动识别人物图、源视频、背景图与提示词节点。应用作者调整节点后，可通过环境变量覆盖映射，无须修改代码。
 
-### 1. 获取 API Key
+## 文件说明
 
-登录 RunningHub，在个人中心/API 设置中创建 API Key。不要把 Key 写入 GitHub 文件；后面只放到 Railway Variables。
+```text
+.
+├── server.py          # MCP 服务和双阶段编排
+├── requirements.txt   # Python 依赖
+├── Dockerfile         # Railway Docker 构建
+├── railway.json       # Railway 构建、健康检查与重启配置
+├── .env.example       # 环境变量模板
+├── .dockerignore
+├── .gitignore
+├── tests/test_server.py # 节点映射与结果解析测试
+└── README.md
+```
 
-### 2. 确保应用能被 API 调用
+## 一、上传到 GitHub
 
-打开上面的 SCAIL-2 应用。建议先在网页端手工运行一次 3～5 秒测试，再查看页面中的“API”或“工作流 API”。
+新建一个空 GitHub 仓库，然后把本目录中的全部文件上传到仓库根目录。不要上传真实 `.env`，更不要把 RunningHub API Key 写入代码或提交到 GitHub。
 
-如果公共应用不能直接通过你的 API Key 调用：
-
-1. 将应用复制/下载到你的 RunningHub 工作区。
-2. 在你的工作区发布或启用 API 调用。
-3. 复制你自己的新应用 ID。
-4. Railway 中把 `SCAIL_WEBAPP_ID` 改成该 ID。
-
-公共页面的 ID 能否直接调用由应用作者的权限设置决定，所以服务启动后第一步必须调用 `inspect_scail_app` 验证。
-
-## 二、建立 GitHub 仓库
-
-1. 在 GitHub 新建空仓库，例如 `scail2-runninghub-mcp`。
-2. 将本目录全部文件上传到仓库根目录。
-3. 确认 GitHub 中没有 `.env`，只能有 `.env.example`。
-
-也可以本地执行：
+也可在本地执行：
 
 ```bash
 git init
 git add .
-git commit -m "Initial SCAIL-2 RunningHub MCP"
+git commit -m "Initial RunningHub person and background MCP"
 git branch -M main
-git remote add origin https://github.com/你的用户名/scail2-runninghub-mcp.git
+git remote add origin https://github.com/你的用户名/你的仓库名.git
 git push -u origin main
 ```
 
-## 三、Railway 部署
+## 二、Railway 部署
 
 ### 1. 创建服务
 
-1. Railway → **New Project**。
+1. 打开 Railway，点击 **New Project**。
 2. 选择 **Deploy from GitHub repo**。
-3. 选择刚创建的仓库。
-4. Railway 会读取 `Dockerfile` 和 `railway.json` 自动构建。
+3. 选择刚上传的仓库。
+4. Railway 会读取 `railway.json` 和 `Dockerfile` 自动构建。
 
-### 2. 配置 Variables
+### 2. 添加环境变量
 
-在 Railway 服务 → **Variables** 中添加：
+在 Railway 服务的 **Variables** 页面添加：
 
-| 变量 | 必填 | 值 |
-|---|---:|---|
-| `RUNNINGHUB_API_KEY` | 是 | 你的 RunningHub API Key |
-| `SCAIL_WEBAPP_ID` | 是 | 默认 `2064610888811900929`，或你复制后自己的应用 ID |
-| `RUNNINGHUB_BASE_URL` | 否 | `https://www.runninghub.cn` |
-| `MAX_DOWNLOAD_MB` | 否 | 默认 `500` |
-| `SCHEMA_CACHE_SECONDS` | 否 | 默认 `600` |
-| `PUBLIC_DOMAIN` | 自定义域名时 | 例如 `scail.example.com`，不要带 `https://` |
+| 变量 | 值 | 是否必需 |
+| --- | --- | --- |
+| `RUNNINGHUB_API_KEY` | RunningHub 控制台中的 API Key | 必需 |
+| `SCAIL_WEBAPP_ID` | `2067490689415471105` | 建议填写 |
+| `BERNINI_WEBAPP_ID` | `2062558412986216449` | 建议填写 |
+| `DATA_DIR` | `/data` | 必需（配合 Volume） |
+| `PUBLIC_BASE_URL` | 部署后生成的 Railway 域名，如 `https://xxx.up.railway.app` | 部署生成域名后补填 |
+| `MAX_UPLOAD_MB` | `300` | 可选 |
+| `MAX_DOWNLOAD_MB` | `2048` | 可选 |
+| `NODE_CACHE_TTL_SECONDS` | `3600` | 可选 |
+| `ALLOW_CONCURRENT_PIPELINES` | `false` | 建议保持 false |
+| `KEEP_INTERMEDIATE_FILES` | `false` | 可选 |
 
 不要手工设置 `PORT`，Railway 会自动注入。
 
-本服务不需要 Railway Volume。附件只暂存在容器临时目录，上传 RunningHub 后立即删除；任务及作品保存在 RunningHub。
+### 3. 挂载 Volume
 
-### 3. 生成公网域名
+1. 打开 Railway 项目画布。
+2. 选择当前服务，进入 **Volumes**。
+3. 点击 **Add Volume**。
+4. Mount Path 填写：`/data`。
+5. 保存并重新部署。
 
-Railway 服务 → **Settings** → **Networking** → **Generate Domain**。
+Volume 保存任务状态、原始音频以及最终视频。没有 Volume 时，重新部署可能丢失正在编排的任务和已处理视频。
 
-假设域名是：
+### 4. 生成域名
 
-```text
-scail2-production.up.railway.app
-```
+1. 进入 **Settings → Networking → Public Networking**。
+2. 点击 **Generate Domain**。
+3. 复制生成的 HTTPS 域名。
+4. 返回 Variables，将 `PUBLIC_BASE_URL` 设置为该域名，末尾不要加 `/`。
+5. 再部署一次。
 
 检查：
 
 ```text
-https://scail2-production.up.railway.app/health
+https://你的域名/health
 ```
 
-应返回：
+成功时应返回 `"ok": true` 和 `"api_key_configured": true`。
+
+## 三、连接 ChatGPT
+
+MCP 地址：
+
+```text
+https://你的域名/mcp
+```
+
+在 ChatGPT 的应用/MCP 设置中添加这个地址。若连接界面要求末尾斜杠，也可以使用：
+
+```text
+https://你的域名/mcp/
+```
+
+连接或重新连接后，先调用：
+
+```text
+inspect_person_background_pipeline
+```
+
+这是只读检查，不消耗 RH。确认返回的自动映射中：
+
+- SCAIL `person_image` 指向人物参考图节点；
+- SCAIL `source_video` 指向驱动视频节点；
+- Bernini `source_video` 指向原视频节点；
+- Bernini `background_image` 指向背景参考图节点。
+
+如果映射错误或提示歧义，在 Railway Variables 中填写相应的 `*_NODE_ID` 和 `*_FIELD_NAME`。完整变量名见 `.env.example`。修改后重新部署，再次执行检查。
+
+## 四、生成视频
+
+准备三个附件：
+
+1. `reference_person_image_file`：清晰、完整的人物参考图；
+2. `source_video_file`：动作驱动视频；
+3. `background_image_file`：**无人物、无文字、无水印的干净背景图**。
+
+背景图若仍包含人物，可能生成重复人物或人物残影。应先对图片做人物移除和背景补全。
+
+调用：
+
+```text
+submit_person_background_replacement_from_chatgpt_attachments
+```
+
+关键参数：
 
 ```json
-{"status":"ok","configured":true}
+{
+  "confirm_rh_charge": true,
+  "stage1_output_index": 0,
+  "preserve_original_audio_and_duration": true
+}
 ```
 
-MCP 地址为：
+提交成功后会返回 `pipeline_id` 和 `stage1_task_id`。继续调用：
 
 ```text
-https://scail2-production.up.railway.app/mcp
+wait_person_background_replacement
 ```
 
-如果 `/health` 正常但 MCP 返回 `421 Invalid Host header`，说明使用了自定义域名但未配置 `PUBLIC_DOMAIN`。把它设置成实际公网域名并重新部署。
+等待最长 900 秒。若超时，保留同一个 `pipeline_id` 再调用一次，不要重复提交，以免重复消耗 RH。
 
-## 四、连接 ChatGPT
+流程状态：
 
-1. ChatGPT 工作区设置 → Apps/Connectors → 创建自定义 MCP。
-2. 名称填写 `SCAIL-2`。
-3. MCP URL 填写 Railway 的 `/mcp` 完整地址。
-4. 保存并连接。
+| 状态 | 含义 |
+| --- | --- |
+| `stage1_running` | SCAIL 正在换人 |
+| `stage2_preparing` | 正在下载第一阶段结果并提交 Bernini |
+| `stage2_running` | Bernini 正在换背景 |
+| `completed` | 完成，读取 `final_video_url` |
+| `stage1_failed` | 换人失败，不会提交第二阶段 |
+| `stage2_failed` | 背景阶段失败 |
 
-连接后先执行：
+默认禁止同时运行多个编排任务，以避免 RunningHub 并发限制导致无效扣费或 `805` 错误。前一个任务完成后再提交下一个。
 
-```text
-调用 inspect_scail_app，只读检查，不创建任务。
-```
+## 五、人物替换结果有多个版本
 
-检查结果应包含至少一个图片输入和一个视频输入。如果自动识别的节点不正确，按照“节点覆盖”部分配置。
-
-## 五、第一次安全测试
-
-推荐先准备：
-
-- 一张清晰、单人、正面或大半侧面、最好包含全身的参考图片。
-- 一段 3～5 秒、单人、人物无遮挡、镜头变化较小的 MP4。
-
-对 ChatGPT 说：
-
-```text
-使用 SCAIL-2，用参考图片替换视频中的主要人物。
-先提交 5 秒测试，我同意本次消耗 RH 币。提交后返回 task_id，不要重复提交。
-```
-
-提交成功后使用 `get_scail_task` 查询。不要因为任务仍在 `QUEUED` 或 `RUNNING` 状态而重复创建任务。
-
-## 六、节点自动识别与手工覆盖
-
-服务从 RunningHub 的 `/api/webapp/apiCallDemo` 动态读取 `nodeInfoList`，优先按字段类型和中英文描述识别：
-
-- `reference_image`：参考人物图
-- `source_video`：原视频/驱动视频
-- `mode`：Replacement/角色替换
-- `prompt`：提示词
-- `target_subject`：原视频中需要编辑的主体
-- `reference_subject`：参考图中的主体
-
-如果应用作者更新后自动识别错误：
-
-1. 调用 `inspect_scail_app(force_refresh=true)`。
-2. 找到正确的 `nodeId` 和 `fieldName`。
-3. Railway Variables 添加一行 JSON（必须单行）：
+部分 SCAIL 应用会返回多个 MP4。默认使用第一个，即：
 
 ```json
-{"reference_image":{"nodeId":"10","fieldName":"image"},"source_video":{"nodeId":"7","fieldName":"video"},"mode":{"nodeId":"1","fieldName":"mode"}}
+{"stage1_output_index": 0}
 ```
 
-变量名为：
+如果第一版本不合适，可在新任务中选择 `1`。不要在同一个 pipeline 中重复切换，因为第二阶段一旦提交已经产生 RH 消耗。
 
-```text
-SCAIL_NODE_OVERRIDES_JSON
-```
+## 六、常见问题
 
-重新部署后再次只读检查。
+### `RUNNINGHUB_API_KEY is not configured`
 
-## 七、本地运行
+Railway 没有添加 API Key，或添加后没有重新部署。
+
+### `Ambiguous image/video input`
+
+应用出现多个同类上传节点。调用检查工具，查看 `all_nodes`，然后设置 `.env.example` 中对应的节点覆盖变量。
+
+### 第一阶段成功但第二阶段没有开始
+
+再次调用 `get_person_background_replacement` 或 `wait_person_background_replacement`。本项目采用可恢复的分阶段编排，避免单个 ChatGPT 请求连接中断后丢失任务。
+
+### 返回 805 或并发错误
+
+等待当前 RunningHub 任务完成。保持 `ALLOW_CONCURRENT_PIPELINES=false`，不要重复提交。
+
+### 背景出现第二个人物
+
+上传的是包含人物的完整参考照片，而不是干净背景图。先移除照片人物并补全被遮挡区域。
+
+### 最终链接打不开
+
+确认 `PUBLIC_BASE_URL` 与 Railway 当前公网域名完全一致，并检查 Volume 是否挂载到 `/data`。原始 Bernini 结果仍保存在 `stage2_results` 中，可作为备用链接。
+
+## 七、本地启动
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env
+# 手动把 .env 中的变量导入当前 shell，或逐项 export
+python server.py
 ```
 
-将 `.env` 中变量导入 shell 后启动：
+健康检查：`http://localhost:8000/health`
+
+MCP：`http://localhost:8000/mcp`
+
+运行基础测试：
 
 ```bash
-set -a
-source .env
-set +a
-uvicorn server:app --host 127.0.0.1 --port 8000
+python -m unittest discover -s tests -v
 ```
 
-本地 MCP：`http://127.0.0.1:8000/mcp`
+## API 依据
 
-## 八、常见错误
+项目使用 RunningHub 官方接口：
 
-### `configured:false`
-
-Railway 未配置 `RUNNINGHUB_API_KEY`，或变量修改后尚未重新部署。
-
-### `无法读取 SCAIL-2 应用输入`
-
-常见原因：
-
-- 公共应用未对你的账户开放 API。
-- `SCAIL_WEBAPP_ID` 填错。
-- 需要先复制应用到自己的 RunningHub 工作区并启用 API。
-
-### `未能自动识别参考图片或驱动视频节点`
-
-调用 `inspect_scail_app`，再配置 `SCAIL_NODE_OVERRIDES_JSON`。
-
-### RunningHub 有任务，但 ChatGPT 超时
-
-视频任务可能运行数分钟到数十分钟。超时不表示 RunningHub 任务停止。保留 `task_id`，稍后调用 `get_scail_task`。
-
-### 背景或商品发生变化
-
-- 将提示词改为只替换人物、保持背景和物品不变。
-- 使用更短的视频测试。
-- 参考图人物大小和原视频人物占比尽量相似。
-- 遮挡、快速转身时增加侧面/背面参考图需要换用支持多参考图的 SCAIL-2 应用并更新 `SCAIL_WEBAPP_ID`。
-
-## 九、安全说明
-
-- API Key 只存 Railway Variables，不提交 GitHub。
-- 日志不打印 API Key 和媒体内容。
-- 媒体下载拒绝 localhost、内网和保留 IP，降低 SSRF 风险。
-- 每次生成必须显式确认 RH 扣费。
-- Railway 随机域名不是身份验证。如果你准备公开分享此 MCP，应在前面增加 OAuth/API Gateway；个人自用时不要公开传播 MCP 地址。
-
-## RunningHub 接口
-
-本项目使用：
-
-- `GET /api/webapp/apiCallDemo`：读取 AI 应用调用示例及输入节点。
-- `POST /openapi/v2/media/upload/binary`：上传图片/视频。
-- `POST /task/openapi/ai-app/run`：提交 AI 应用任务。
-- `POST /task/openapi/status`：查询任务状态。
-- `POST /task/openapi/outputs`：读取任务输出及 RH 消耗。
-
-RunningHub 已标记旧状态/输出接口将废弃；接口完全下线时，只需在 `server.py` 的 `get_task` 中切换到 RunningHub V2 查询接口，其余上传、节点识别和 MCP 工具无需修改。
-
+- `GET /api/webapp/apiCallDemo`：获取 AI App 最新 `nodeInfoList`；
+- `POST /openapi/v2/media/upload/binary`：上传图片和视频；
+- `POST /task/openapi/ai-app/run`：提交 AI App 任务；
+- `POST /openapi/v2/query`：查询任务状态和结果。
