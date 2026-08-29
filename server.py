@@ -18,6 +18,7 @@ from urllib.parse import unquote, urljoin, urlparse
 import httpx
 from mcp.server import MCPServer
 from mcp.server.transport_security import TransportSecuritySettings
+from pydantic import BaseModel, ConfigDict, Field
 from starlette.requests import Request
 from starlette.responses import JSONResponse, RedirectResponse, Response
 
@@ -75,6 +76,26 @@ SETTINGS = Settings.from_env()
 
 class RunningHubError(RuntimeError):
     pass
+
+
+class OpenAIFile(BaseModel):
+    """ChatGPT attachment supplied to a declared OpenAI file parameter."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    download_url: str = Field(
+        description="Temporary URL that the MCP server can download"
+    )
+    file_id: str = Field(description="ChatGPT file identifier")
+    # ChatGPT may omit these fields.  They intentionally remain JSON Schema
+    # strings (rather than string|null) when present; see the schema finalizer
+    # below.
+    mime_type: str = Field(  # type: ignore[assignment]
+        default=None, description="File MIME type"
+    )
+    file_name: str = Field(  # type: ignore[assignment]
+        default=None, description="Original file name"
+    )
 
 
 def _headers() -> dict[str, str]:
@@ -508,6 +529,18 @@ async def upload_remote_media(url: str, expected_type: str) -> str:
         Path(path).unlink(missing_ok=True)
 
 
+async def upload_chatgpt_media(file: OpenAIFile, expected_type: str) -> str:
+    """Download a declared ChatGPT attachment and upload it to RunningHub."""
+
+    declared_type = (file.mime_type or "").strip().lower()
+    if declared_type and not declared_type.startswith(f"{expected_type}/"):
+        raise RunningHubError(
+            f"附件 {file.file_name or file.file_id} 类型不正确："
+            f"需要 {expected_type}，收到 {file.mime_type}"
+        )
+    return await upload_remote_media(file.download_url, expected_type)
+
+
 def _extract_task_id(payload: dict[str, Any]) -> str:
     data = payload.get("data")
     candidates: list[Any] = [payload.get("taskId"), payload.get("task_id")]
@@ -533,6 +566,41 @@ async def submit_task(node_info_list: list[dict[str, Any]]) -> str:
         timeout=120.0,
     )
     return _extract_task_id(payload)
+
+
+async def submit_scail_with_uploaded_media(
+    *,
+    schema: dict[str, Any],
+    image_file: str,
+    video_file: str,
+    prompt: str,
+    target_subject: str,
+    reference_subject: str,
+) -> dict[str, Any]:
+    """Submit one SCAIL task after both media files exist in RunningHub."""
+
+    node_info_list, selected_nodes = build_node_info_list(
+        schema,
+        image_file_name=image_file,
+        video_file_name=video_file,
+        prompt=prompt,
+        target_subject=target_subject,
+        reference_subject=reference_subject,
+    )
+    task_id = await submit_task(node_info_list)
+    logger.info(
+        "SCAIL task submitted task_id=%s webapp_id=%s",
+        task_id,
+        SETTINGS.scail_webapp_id,
+    )
+    return {
+        "submitted": True,
+        "task_id": task_id,
+        "status": "SUBMITTED",
+        "webapp_id": SETTINGS.scail_webapp_id,
+        "selected_nodes": selected_nodes,
+        "next_action": "稍后调用 get_scail_task(task_id) 查询结果。",
+    }
 
 
 def _normalize_status(payload: dict[str, Any]) -> str:
@@ -619,10 +687,48 @@ mcp = MCPServer(
     "SCAIL-2 RunningHub",
     instructions=(
         "使用 RunningHub 的 SCAIL-2 应用完成参考图片人物替换视频人物。"
+        "ChatGPT 对话附件优先使用 submit_scail_replacement_from_chatgpt_attachments；"
+        "只有已经存在公网直链时才使用 submit_scail_replacement。"
         "提交任务会消耗 RH 币，只有用户明确同意且 confirm_rh_charge=true 时才提交。"
         "任务通常运行较久，提交后用 get_scail_task 查询。"
     ),
 )
+
+
+def finalize_openai_file_param_schema(
+    tool_name: str, *parameter_names: str
+) -> None:
+    """Make MCPServer's JSON Schema comply with ChatGPT file parameters."""
+
+    tool = mcp._tool_manager.get_tool(tool_name)  # noqa: SLF001
+    if tool is None:
+        raise RuntimeError(f"Missing registered tool: {tool_name}")
+    properties = tool.parameters.get("properties", {})
+    definitions = tool.parameters.get("$defs", {})
+    for parameter_name in parameter_names:
+        file_schema = properties.get(parameter_name)
+        if not isinstance(file_schema, dict):
+            raise RuntimeError(f"Missing file parameter schema: {parameter_name}")
+
+        reference = file_schema.get("$ref")
+        if isinstance(reference, str) and reference.startswith("#/$defs/"):
+            definition_name = reference.rsplit("/", 1)[-1]
+            definition = definitions.get(definition_name)
+            if not isinstance(definition, dict):
+                raise RuntimeError(
+                    f"Missing file parameter definition: {definition_name}"
+                )
+            # ChatGPT's file-parameter contract expects the object schema on the
+            # parameter itself rather than only through a local $ref.
+            file_schema.clear()
+            file_schema.update(definition)
+
+        file_schema["additionalProperties"] = False
+        for optional_name in ("mime_type", "file_name"):
+            optional_schema = file_schema.get("properties", {}).get(
+                optional_name, {}
+            )
+            optional_schema.pop("default", None)
 
 
 @mcp.tool()
@@ -653,24 +759,66 @@ async def submit_scail_replacement(
         upload_remote_media(reference_image_url, "image"),
         upload_remote_media(source_video_url, "video"),
     )
-    node_info_list, selected_nodes = build_node_info_list(
-        schema,
-        image_file_name=image_file,
-        video_file_name=video_file,
+    return await submit_scail_with_uploaded_media(
+        schema=schema,
+        image_file=image_file,
+        video_file=video_file,
         prompt=prompt,
         target_subject=target_subject,
         reference_subject=reference_subject,
     )
-    task_id = await submit_task(node_info_list)
-    logger.info("SCAIL task submitted task_id=%s webapp_id=%s", task_id, SETTINGS.scail_webapp_id)
-    return {
-        "submitted": True,
-        "task_id": task_id,
-        "status": "SUBMITTED",
-        "webapp_id": SETTINGS.scail_webapp_id,
-        "selected_nodes": selected_nodes,
-        "next_action": "稍后调用 get_scail_task(task_id) 查询结果。",
-    }
+
+
+@mcp.tool(
+    meta={
+        "openai/fileParams": [
+            "reference_image_file",
+            "source_video_file",
+        ]
+    },
+    annotations={
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": True,
+    },
+)
+async def submit_scail_replacement_from_chatgpt_attachments(
+    reference_image_file: OpenAIFile,
+    source_video_file: OpenAIFile,
+    confirm_rh_charge: bool,
+    prompt: str = "保持原视频背景、镜头、动作和节奏，只替换目标人物；保持参考人物身份、脸部、发型、服装和身体比例稳定。",
+    target_subject: str = "视频中的主要人物",
+    reference_subject: str = "参考图片中的人物",
+) -> dict[str, Any]:
+    """直接使用 ChatGPT 的参考图和视频附件创建 SCAIL-2 替换任务；会消耗 RH 币。"""
+
+    if not confirm_rh_charge:
+        return {
+            "submitted": False,
+            "message": "未提交：confirm_rh_charge=false。请先取得用户对本次 RH 扣费的明确同意。",
+        }
+
+    schema = await fetch_app_schema()
+    image_file, video_file = await asyncio.gather(
+        upload_chatgpt_media(reference_image_file, "image"),
+        upload_chatgpt_media(source_video_file, "video"),
+    )
+    return await submit_scail_with_uploaded_media(
+        schema=schema,
+        image_file=image_file,
+        video_file=video_file,
+        prompt=prompt,
+        target_subject=target_subject,
+        reference_subject=reference_subject,
+    )
+
+
+finalize_openai_file_param_schema(
+    "submit_scail_replacement_from_chatgpt_attachments",
+    "reference_image_file",
+    "source_video_file",
+)
 
 
 @mcp.tool()
