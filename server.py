@@ -114,7 +114,11 @@ def finalize_openai_file_param_schema(
 ) -> None:
     """Expose file parameters in the exact schema expected by ChatGPT apps."""
 
-    tool = mcp._tool_manager.get_tool(tool_name)  # noqa: SLF001
+    # FastMCP 2.14.x exposes get_tool() as an async API. This schema adjustment
+    # runs during module import, before an event loop exists, so read the tool
+    # from the manager's local registry instead of creating an un-awaited
+    # coroutine. requirements.txt pins the compatible FastMCP version.
+    tool = mcp._tool_manager._tools.get(tool_name)  # noqa: SLF001
     if tool is None:
         raise RuntimeError(f"Missing registered tool: {tool_name}")
     properties = tool.parameters.get("properties", {})
