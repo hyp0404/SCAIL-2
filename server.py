@@ -1,455 +1,1062 @@
+"""RunningHub two-stage person + background replacement MCP server.
+
+Stage 1: SCAIL-2 replaces the person while keeping motion/camera structure.
+Stage 2: Bernini-R replaces the environment from a background reference image.
+
+The server discovers each public AI App's configurable nodeInfoList at runtime,
+so it does not depend on brittle hard-coded node IDs. Optional environment
+variables can override automatic node selection when an app author changes the
+published workflow.
+"""
+
+from __future__ import annotations
+
+import asyncio
 import ipaddress
+import json
+import mimetypes
 import os
+import re
+import shutil
 import socket
-from html import escape
-from pathlib import PurePosixPath
-from urllib.parse import urlparse
+import subprocess
+import time
+import uuid
+from fractions import Fraction
+from pathlib import Path
+from typing import Annotated, Any
+from urllib.parse import unquote, urljoin, urlparse
 
 import httpx
 from fastmcp import FastMCP
 from pydantic import BaseModel, ConfigDict, Field
 from starlette.requests import Request
-from starlette.responses import HTMLResponse, PlainTextResponse
+from starlette.responses import FileResponse, JSONResponse
 
+
+RUNNINGHUB_BASE_URL = os.getenv("RUNNINGHUB_BASE_URL", "https://www.runninghub.cn").rstrip("/")
 RUNNINGHUB_API_KEY = os.getenv("RUNNINGHUB_API_KEY", "").strip()
-RUNNINGHUB_BASE_URL = os.getenv(
-    "RUNNINGHUB_BASE_URL", "https://www.runninghub.cn"
-).rstrip("/")
-MCP_PATH_SECRET = os.getenv("MCP_PATH_SECRET", "").strip().strip("/")
-PORT = int(os.getenv("PORT", "8080"))
-MAX_REMOTE_FILE_BYTES = int(os.getenv("MAX_REMOTE_FILE_BYTES", str(200 * 1024 * 1024)))
+SCAIL_WEBAPP_ID = os.getenv("SCAIL_WEBAPP_ID", "2067490689415471105").strip()
+BERNINI_WEBAPP_ID = os.getenv("BERNINI_WEBAPP_ID", "2062558412986216449").strip()
+DATA_DIR = Path(os.getenv("DATA_DIR", "/data")).expanduser()
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
+MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "300"))
+MAX_DOWNLOAD_MB = int(os.getenv("MAX_DOWNLOAD_MB", "2048"))
+NODE_CACHE_TTL_SECONDS = int(os.getenv("NODE_CACHE_TTL_SECONDS", "3600"))
+ALLOW_CONCURRENT_PIPELINES = os.getenv("ALLOW_CONCURRENT_PIPELINES", "false").lower() == "true"
+KEEP_INTERMEDIATE_FILES = os.getenv("KEEP_INTERMEDIATE_FILES", "false").lower() == "true"
+BERNINI_FRAME_MULTIPLE = max(1, int(os.getenv("BERNINI_FRAME_MULTIPLE", "4")))
+BERNINI_FRAME_OFFSET = int(os.getenv("BERNINI_FRAME_OFFSET", "1"))
+BERNINI_MAX_FRAMES = max(1, int(os.getenv("BERNINI_MAX_FRAMES", "4097")))
 
-if not RUNNINGHUB_API_KEY:
-    raise RuntimeError("RUNNINGHUB_API_KEY is required")
-if not MCP_PATH_SECRET:
-    raise RuntimeError("MCP_PATH_SECRET is required")
-
-AUTH_HEADERS = {"Authorization": f"Bearer {RUNNINGHUB_API_KEY}"}
-
-mcp = FastMCP("RunningHub Character Replace")
+IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp"}
+VIDEO_SUFFIXES = {".mp4", ".mov", ".mkv", ".avi", ".webm"}
+CONTENT_TYPE_SUFFIXES = {
+    "image/jpeg": ".jpg",
+    "image/png": ".png",
+    "image/webp": ".webp",
+    "video/mp4": ".mp4",
+    "video/quicktime": ".mov",
+    "video/x-matroska": ".mkv",
+    "video/x-msvideo": ".avi",
+    "video/webm": ".webm",
+}
 
 
 class OpenAIFile(BaseModel):
-    """File object supplied by ChatGPT for a declared OpenAI file parameter."""
+    """ChatGPT attachment passed through the OpenAI MCP file contract."""
 
     model_config = ConfigDict(extra="forbid")
 
-    download_url: str = Field(description="Temporary URL that the MCP server can download")
-    file_id: str = Field(description="ChatGPT file identifier")
-    # These fields are optional at the object level but remain JSON Schema
-    # strings when present, as required by ChatGPT's file-parameter contract.
-    mime_type: str = Field(default=None, description="File MIME type")
-    file_name: str = Field(default=None, description="Original file name")
+    download_url: str = Field(
+        description="Temporary HTTPS URL that the Railway MCP server can download"
+    )
+    file_id: str = Field(description="ChatGPT attachment file identifier")
+    # ChatGPT may omit these fields. Keeping a string schema with a None default
+    # is intentional: the schema finalizer below removes the default without
+    # turning the fields into nullable unions.
+    mime_type: str = Field(default=None, description="Attachment MIME type")  # type: ignore[assignment]
+    file_name: str = Field(default=None, description="Original attachment name")  # type: ignore[assignment]
+
+if not DATA_DIR.parent.exists():
+    DATA_DIR = Path("./data")
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+PIPELINES_DIR = DATA_DIR / "pipelines"
+PIPELINES_DIR.mkdir(parents=True, exist_ok=True)
+
+DEFAULT_STAGE1_PROMPT = (
+    "Replace only the target person in the source video with the person from the reference image. "
+    "Preserve the source video's complete motion, pose, timing, camera movement, framing, props and "
+    "background. Preserve the reference person's identity, face, hair, body proportions, complete outfit "
+    "and footwear. Natural temporal consistency, no flicker, no extra limbs, no text, no logo, no watermark."
+)
+
+DEFAULT_STAGE2_PROMPT = (
+    "Replace only the entire environment and background with the scene from the background reference image. "
+    "Keep the foreground person's identity, face, hair, body, clothing, footwear, hand-held objects, pose, "
+    "motion, timing and camera framing unchanged. Use only the environment from the background reference; "
+    "ignore and remove any person, text, logo or watermark contained in that reference. Match perspective, "
+    "shadows, lighting and color naturally. No duplicate person and no background remnants."
+)
+
+mcp = FastMCP(
+    name="RunningHub Person + Background Replacement",
+    instructions=(
+        "Two-stage RunningHub video editor. First use SCAIL-2 to replace the person, then Bernini-R "
+        "to replace the background. Submitting a pipeline consumes RunningHub RH. Always require the "
+        "user's explicit confirm_rh_charge=true before submission."
+    ),
+)
 
 
-def finalize_openai_file_param_schema(tool, *parameter_names: str) -> None:
-    """Keep FastMCP's generated schema compliant with ChatGPT file params."""
+def finalize_openai_file_param_schema(
+    tool_name: str, *parameter_names: str
+) -> None:
+    """Expose file parameters in the exact schema expected by ChatGPT apps."""
+
+    tool = mcp._tool_manager.get_tool(tool_name)  # noqa: SLF001
+    if tool is None:
+        raise RuntimeError(f"Missing registered tool: {tool_name}")
     properties = tool.parameters.get("properties", {})
+    definitions = tool.parameters.get("$defs", {})
     for parameter_name in parameter_names:
         file_schema = properties.get(parameter_name)
         if not isinstance(file_schema, dict):
             raise RuntimeError(f"Missing file parameter schema: {parameter_name}")
-        file_schema["additionalProperties"] = False
-        for optional_name in ("mime_type", "file_name"):
-            optional_schema = file_schema.get("properties", {}).get(optional_name, {})
-            optional_schema.pop("default", None)
 
-
-async def rh_post(path: str, *, json=None, files=None, data=None, timeout=120):
-    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
-        resp = await client.post(
-            f"{RUNNINGHUB_BASE_URL}{path}",
-            headers=AUTH_HEADERS,
-            json=json,
-            files=files,
-            data=data,
-        )
-        resp.raise_for_status()
-        return resp.json()
-
-
-def extract_runninghub_filename(result: dict) -> str:
-    """Accept both filename and fileName returned by different RunningHub responses."""
-    data = result.get("data") or {}
-    filename = data.get("filename") or data.get("fileName")
-    if not filename:
-        raise RuntimeError(f"RunningHub upload failed: {result}")
-    return str(filename)
-
-
-async def upload_bytes_to_runninghub(
-    content: bytes,
-    filename_in: str,
-    content_type: str = "application/octet-stream",
-) -> str:
-    if not content:
-        raise ValueError(f"{filename_in} is empty")
-
-    result = await rh_post(
-        "/openapi/v2/media/upload/binary",
-        files={"file": (filename_in, content, content_type)},
-        timeout=300,
-    )
-    return extract_runninghub_filename(result)
-
-
-async def upload_to_runninghub(upload) -> str:
-    content = await upload.read()
-    filename_in = getattr(upload, "filename", None) or "upload.bin"
-    content_type = getattr(upload, "content_type", None) or "application/octet-stream"
-    return await upload_bytes_to_runninghub(content, filename_in, content_type)
-
-
-def _ensure_public_http_url(url: str) -> str:
-    """Basic SSRF protection for the URL-based MCP tools."""
-    parsed = urlparse(url)
-    if parsed.scheme not in {"http", "https"}:
-        raise ValueError("Only http:// or https:// URLs are supported")
-    if not parsed.hostname:
-        raise ValueError("URL must include a hostname")
-
-    host = parsed.hostname.lower()
-    if host in {"localhost", "localhost.localdomain"}:
-        raise ValueError("Localhost URLs are not allowed")
-
-    try:
-        infos = socket.getaddrinfo(host, parsed.port or (443 if parsed.scheme == "https" else 80))
-    except socket.gaierror as exc:
-        raise ValueError(f"Cannot resolve URL hostname: {host}") from exc
-
-    for info in infos:
-        ip = ipaddress.ip_address(info[4][0])
-        if (
-            ip.is_private
-            or ip.is_loopback
-            or ip.is_link_local
-            or ip.is_multicast
-            or ip.is_reserved
-            or ip.is_unspecified
-        ):
-            raise ValueError("Private or local network URLs are not allowed")
-
-    return url
-
-
-async def download_public_file(url: str, filename_hint: str | None = None) -> tuple[bytes, str, str]:
-    """Download a publicly reachable file for forwarding to RunningHub."""
-    url = _ensure_public_http_url(url)
-
-    async with httpx.AsyncClient(timeout=300, follow_redirects=True) as client:
-        async with client.stream("GET", url) as resp:
-            resp.raise_for_status()
-
-            content_length = resp.headers.get("content-length")
-            if content_length and int(content_length) > MAX_REMOTE_FILE_BYTES:
-                raise ValueError(
-                    f"Remote file is too large; limit is {MAX_REMOTE_FILE_BYTES} bytes"
+        reference = file_schema.get("$ref")
+        if isinstance(reference, str) and reference.startswith("#/$defs/"):
+            definition_name = reference.rsplit("/", 1)[-1]
+            definition = definitions.get(definition_name)
+            if not isinstance(definition, dict):
+                raise RuntimeError(
+                    f"Missing file parameter definition: {definition_name}"
                 )
+            file_schema.clear()
+            file_schema.update(definition)
 
-            chunks = []
-            total = 0
-            async for chunk in resp.aiter_bytes():
-                total += len(chunk)
-                if total > MAX_REMOTE_FILE_BYTES:
-                    raise ValueError(
-                        f"Remote file is too large; limit is {MAX_REMOTE_FILE_BYTES} bytes"
-                    )
-                chunks.append(chunk)
+        file_schema["additionalProperties"] = False
+        file_properties = file_schema.get("properties", {})
+        for optional_name in ("mime_type", "file_name"):
+            optional_schema = file_properties.get(optional_name)
+            if isinstance(optional_schema, dict):
+                optional_schema.pop("default", None)
 
-            content = b"".join(chunks)
-            if not content:
-                raise ValueError("Downloaded file is empty")
-
-            content_type = (
-                resp.headers.get("content-type", "application/octet-stream")
-                .split(";", 1)[0]
-                .strip()
-            ) or "application/octet-stream"
-
-    if filename_hint:
-        filename = PurePosixPath(filename_hint).name
-    else:
-        filename = PurePosixPath(urlparse(url).path).name or "remote-upload.bin"
-
-    return content, filename, content_type
+_node_cache: dict[str, tuple[float, list[dict[str, Any]]]] = {}
+_state_lock = asyncio.Lock()
 
 
-async def upload_public_url_to_runninghub(url: str, filename_hint: str | None = None) -> str:
-    content, filename, content_type = await download_public_file(url, filename_hint)
-    return await upload_bytes_to_runninghub(content, filename, content_type)
+def _require_api_key() -> None:
+    if not RUNNINGHUB_API_KEY:
+        raise ValueError("RUNNINGHUB_API_KEY is not configured on Railway")
 
 
-async def upload_chatgpt_file_to_runninghub(
-    file: OpenAIFile,
+def _headers() -> dict[str, str]:
+    return {
+        "Authorization": f"Bearer {RUNNINGHUB_API_KEY}",
+        "Accept": "application/json",
+        "User-Agent": "runninghub-person-background-mcp/1.0",
+    }
+
+
+def _client() -> httpx.AsyncClient:
+    timeout = httpx.Timeout(connect=30.0, read=300.0, write=300.0, pool=30.0)
+    return httpx.AsyncClient(timeout=timeout, follow_redirects=True, headers=_headers())
+
+
+def _public_client(*, follow_redirects: bool = False) -> httpx.AsyncClient:
+    """HTTP client for untrusted media URLs; never forwards the RunningHub key."""
+    timeout = httpx.Timeout(connect=30.0, read=300.0, write=300.0, pool=30.0)
+    return httpx.AsyncClient(
+        timeout=timeout,
+        follow_redirects=follow_redirects,
+        headers={"Accept": "*/*", "User-Agent": "runninghub-person-background-mcp/1.1"},
+    )
+
+
+def _unwrap_response(payload: dict[str, Any]) -> dict[str, Any]:
+    if "code" in payload and payload.get("code") not in (0, "0", None):
+        message = payload.get("msg") or payload.get("message") or "RunningHub request failed"
+        raise RuntimeError(f"RunningHub error {payload.get('code')}: {message}")
+    data = payload.get("data")
+    return data if isinstance(data, dict) else payload
+
+
+async def _get_nodes(webapp_id: str, force_refresh: bool = False) -> list[dict[str, Any]]:
+    _require_api_key()
+    cached = _node_cache.get(webapp_id)
+    if cached and not force_refresh and time.time() - cached[0] < NODE_CACHE_TTL_SECONDS:
+        return cached[1]
+
+    endpoint = f"{RUNNINGHUB_BASE_URL}/api/webapp/apiCallDemo"
+    async with _client() as client:
+        response = await client.get(endpoint, params={"webappId": webapp_id})
+        response.raise_for_status()
+        payload = response.json()
+        try:
+            data = _unwrap_response(payload)
+        except RuntimeError:
+            # Some RunningHub deployments still require apiKey in the query as
+            # well as the Bearer header. Retry only after the safer form fails.
+            response = await client.get(
+                endpoint,
+                params={"webappId": webapp_id, "apiKey": RUNNINGHUB_API_KEY},
+            )
+            response.raise_for_status()
+            data = _unwrap_response(response.json())
+
+    nodes = data.get("nodeInfoList")
+    if not isinstance(nodes, list) or not nodes:
+        raise RuntimeError(f"No configurable nodeInfoList returned for AI App {webapp_id}")
+    normalized = [dict(node) for node in nodes if isinstance(node, dict)]
+    _node_cache[webapp_id] = (time.time(), normalized)
+    return normalized
+
+
+def _node_text(node: dict[str, Any]) -> str:
+    return " ".join(
+        str(node.get(key, ""))
+        for key in ("nodeName", "fieldName", "fieldType", "description", "descriptionEn")
+    ).lower()
+
+
+def _is_type(node: dict[str, Any], kind: str) -> bool:
+    text = _node_text(node)
+    field_type = str(node.get("fieldType", "")).upper()
+    field_name = str(node.get("fieldName", "")).lower()
+    node_name = str(node.get("nodeName", "")).lower()
+    if kind == "image":
+        return "IMAGE" in field_type or field_name in {"image", "images"} or "loadimage" in node_name
+    if kind == "video":
+        return "VIDEO" in field_type or "video" in field_name or "loadvideo" in node_name
+    if kind == "prompt":
+        return (
+            field_name in {"prompt", "text", "positive", "positive_prompt"}
+            or "STRING" in field_type
+            or "prompt" in text
+        )
+    if kind == "integer":
+        return field_type in {"INT", "INTEGER", "NUMBER"} or field_name in {
+            "value", "frames", "frame_count", "num_frames"
+        }
+    return False
+
+
+def _env_override(prefix: str) -> tuple[str, str] | None:
+    node_id = os.getenv(f"{prefix}_NODE_ID", "").strip()
+    field_name = os.getenv(f"{prefix}_FIELD_NAME", "").strip()
+    if node_id and field_name:
+        return node_id, field_name
+    if node_id or field_name:
+        raise ValueError(f"Set both {prefix}_NODE_ID and {prefix}_FIELD_NAME")
+    return None
+
+
+def _score_node(node: dict[str, Any], positive: list[str], negative: list[str]) -> int:
+    text = _node_text(node)
+    score = sum(3 for token in positive if token.lower() in text)
+    score -= sum(4 for token in negative if token.lower() in text)
+    if str(node.get("fieldName", "")).lower() == "prompt":
+        score += 2
+    return score
+
+
+def _resolve_node(
+    nodes: list[dict[str, Any]],
     *,
-    expected_media_kind: str | None = None,
-) -> str:
-    """Download a ChatGPT file parameter and forward it to RunningHub."""
-    declared_type = (file.mime_type or "").strip().lower()
-    if expected_media_kind and declared_type:
-        if not declared_type.startswith(f"{expected_media_kind}/"):
-            raise ValueError(
-                f"Expected a {expected_media_kind} file, got {file.mime_type}"
-            )
+    kind: str,
+    env_prefix: str,
+    positive: list[str],
+    negative: list[str] | None = None,
+    required: bool = True,
+) -> dict[str, Any] | None:
+    override = _env_override(env_prefix)
+    if override:
+        node_id, field_name = override
+        for node in nodes:
+            if str(node.get("nodeId")) == node_id and str(node.get("fieldName")) == field_name:
+                return node
+        raise ValueError(
+            f"Configured {env_prefix}={node_id}/{field_name} is absent from the current nodeInfoList"
+        )
 
-    safe_name = PurePosixPath(file.file_name or "").name
-    if not safe_name:
-        safe_name = f"{file.file_id}.bin"
-
-    content, filename, downloaded_type = await download_public_file(
-        file.download_url,
-        safe_name,
+    candidates = [node for node in nodes if _is_type(node, kind)]
+    if not candidates:
+        if required:
+            raise ValueError(f"No {kind} input found; configure {env_prefix}_NODE_ID/FIELD_NAME")
+        return None
+    ranked = sorted(
+        ((_score_node(node, positive, negative or []), node) for node in candidates),
+        key=lambda item: item[0],
+        reverse=True,
     )
-    content_type = declared_type or downloaded_type
-
-    if expected_media_kind and content_type != "application/octet-stream":
-        if not content_type.startswith(f"{expected_media_kind}/"):
-            raise ValueError(
-                f"Expected a {expected_media_kind} file, got {content_type}"
-            )
-
-    return await upload_bytes_to_runninghub(content, filename, content_type)
-
-
-async def submit_character_replace(image_filename: str, video_filename: str) -> dict:
-    payload = {
-        "299##image": image_filename,
-        "275##video": video_filename,
-    }
-    return await rh_post(
-        "/openapi/v2/rhart-video/wan2.2/character-motion-transfer",
-        json=payload,
-        timeout=120,
-    )
+    if len(ranked) == 1 or ranked[0][0] > ranked[1][0]:
+        return ranked[0][1]
+    if ranked[0][0] > 0:
+        tied = [node for score, node in ranked if score == ranked[0][0]]
+        if len(tied) == 1:
+            return tied[0]
+    options = [f"{n.get('nodeId')}/{n.get('fieldName')} ({n.get('description', '')})" for _, n in ranked]
+    if required:
+        raise ValueError(
+            f"Ambiguous {kind} input for {env_prefix}. Set node override after inspect: {options}"
+        )
+    return None
 
 
-@mcp.tool
-async def upload_media_from_url(url: str, filename_hint: str = "") -> dict:
-    """Upload a publicly reachable image/video URL to RunningHub.
-
-    Use this only when the media already has a URL that this MCP server can access.
-    A ChatGPT-local attachment filename by itself is not a usable URL.
-    """
-    filename = await upload_public_url_to_runninghub(url, filename_hint or None)
-    return {"ok": True, "filename": filename}
-
-
-@mcp.tool(
-    meta={"openai/fileParams": ["file"]},
-    annotations={
-        "readOnlyHint": False,
-        "destructiveHint": False,
-        "idempotentHint": False,
-        "openWorldHint": True,
-    },
-)
-async def upload_media_from_chatgpt(file: OpenAIFile) -> dict:
-    """Upload an image or video attached in ChatGPT directly to RunningHub."""
-    filename = await upload_chatgpt_file_to_runninghub(file)
+def _resolve_stage1(nodes: list[dict[str, Any]]) -> dict[str, dict[str, Any] | None]:
     return {
-        "ok": True,
-        "source_file_id": file.file_id,
-        "filename": filename,
+        "person_image": _resolve_node(
+            nodes,
+            kind="image",
+            env_prefix="SCAIL_REFERENCE_IMAGE",
+            positive=["参考", "人物", "角色", "主图", "reference", "character", "subject"],
+            negative=["背景", "background"],
+        ),
+        "source_video": _resolve_node(
+            nodes,
+            kind="video",
+            env_prefix="SCAIL_SOURCE_VIDEO",
+            positive=["驱动", "原视频", "参考视频", "source", "driving", "motion", "video"],
+            negative=["背景", "background"],
+        ),
+        "prompt": _resolve_node(
+            nodes,
+            kind="prompt",
+            env_prefix="SCAIL_PROMPT",
+            positive=["提示", "prompt", "描述", "text"],
+            required=False,
+        ),
     }
 
 
-finalize_openai_file_param_schema(upload_media_from_chatgpt, "file")
-
-
-@mcp.tool
-async def replace_video_character(image_filename: str, video_filename: str) -> dict:
-    """Replace the person in a source video with the person from a reference image.
-
-    image_filename and video_filename must be RunningHub filenames returned by
-    either the private upload page or upload_media_from_url.
-    """
-    return await submit_character_replace(image_filename, video_filename)
-
-
-@mcp.tool
-async def replace_video_character_from_urls(image_url: str, video_url: str) -> dict:
-    """Upload a public reference-image URL and public video URL, then start replacement.
-
-    This avoids manually copying RunningHub filenames when both media files are
-    already available through URLs reachable by this MCP server.
-    """
-    image_filename = await upload_public_url_to_runninghub(image_url)
-    video_filename = await upload_public_url_to_runninghub(video_url)
-    result = await submit_character_replace(image_filename, video_filename)
+def _resolve_stage2(nodes: list[dict[str, Any]]) -> dict[str, dict[str, Any] | None]:
     return {
-        "uploaded": {
-            "image_filename": image_filename,
-            "video_filename": video_filename,
-        },
-        "runninghub": result,
+        "source_video": _resolve_node(
+            nodes,
+            kind="video",
+            env_prefix="BERNINI_SOURCE_VIDEO",
+            positive=["原视频", "参考视频", "source", "input", "video"],
+            negative=["背景视频", "background video"],
+        ),
+        "background_image": _resolve_node(
+            nodes,
+            kind="image",
+            env_prefix="BERNINI_BACKGROUND_IMAGE",
+            positive=["背景", "环境", "场景", "background", "environment", "scene"],
+            negative=["人物", "character", "person"],
+        ),
+        "prompt": _resolve_node(
+            nodes,
+            kind="prompt",
+            env_prefix="BERNINI_PROMPT",
+            positive=["提示", "prompt", "替换要求", "描述", "text"],
+            required=False,
+        ),
+        "frame_count": _resolve_node(
+            nodes,
+            kind="integer",
+            env_prefix="BERNINI_FRAME_COUNT",
+            positive=["视频总帧数", "总帧数", "frame count", "num frames", "frames"],
+            negative=["人数", "person", "seed", "width", "height"],
+            required=False,
+        ),
     }
 
 
-@mcp.tool(
-    meta={"openai/fileParams": ["image_file", "video_file"]},
-    annotations={
-        "readOnlyHint": False,
-        "destructiveHint": False,
-        "idempotentHint": False,
-        "openWorldHint": True,
-    },
-)
-async def replace_video_character_from_chatgpt_attachments(
-    image_file: OpenAIFile,
-    video_file: OpenAIFile,
-) -> dict:
-    """Use a ChatGPT-attached reference image and source video for replacement.
-
-    ChatGPT supplies temporary download URLs for both declared file parameters.
-    This tool downloads them, uploads them to RunningHub, and immediately starts
-    the character-motion-transfer workflow.
-    """
-    image_filename = await upload_chatgpt_file_to_runninghub(
-        image_file,
-        expected_media_kind="image",
-    )
-    video_filename = await upload_chatgpt_file_to_runninghub(
-        video_file,
-        expected_media_kind="video",
-    )
-    result = await submit_character_replace(image_filename, video_filename)
+def _public_node(node: dict[str, Any] | None) -> dict[str, Any] | None:
+    if node is None:
+        return None
     return {
-        "uploaded": {
-            "image_file_id": image_file.file_id,
-            "video_file_id": video_file.file_id,
-            "image_filename": image_filename,
-            "video_filename": video_filename,
-        },
-        "runninghub": result,
+        "nodeId": str(node.get("nodeId", "")),
+        "nodeName": node.get("nodeName"),
+        "fieldName": node.get("fieldName"),
+        "fieldType": node.get("fieldType"),
+        "description": node.get("description") or node.get("descriptionEn"),
+        "fieldValue": node.get("fieldValue"),
     }
 
 
-finalize_openai_file_param_schema(
-    replace_video_character_from_chatgpt_attachments,
-    "image_file",
-    "video_file",
-)
-
-
-@mcp.tool
-async def query_runninghub_task(task_id: str) -> dict:
-    """Query a RunningHub generation task. When it succeeds, return result URLs."""
-    return await rh_post(
-        "/openapi/v2/query",
-        json={"taskId": str(task_id)},
-        timeout=120,
-    )
-
-
-@mcp.tool
-async def runninghub_connection_check() -> dict:
-    """Check this MCP bridge without exposing the RunningHub API key."""
+def _override(node: dict[str, Any], value: Any) -> dict[str, Any]:
     return {
-        "ok": True,
-        "service": "RunningHub Character Replace MCP",
-        "base_url": RUNNINGHUB_BASE_URL,
-        "tools": [
-            "upload_media_from_url",
-            "upload_media_from_chatgpt",
-            "replace_video_character",
-            "replace_video_character_from_urls",
-            "replace_video_character_from_chatgpt_attachments",
-            "query_runninghub_task",
-            "runninghub_connection_check",
-        ],
+        "nodeId": str(node["nodeId"]),
+        "fieldName": str(node["fieldName"]),
+        "fieldValue": value,
     }
 
 
-@mcp.custom_route("/", methods=["GET"])
-async def home(request: Request):
-    return HTMLResponse(
-        "<h2>RunningHub MCP Bridge is running</h2>"
-        "<p>The MCP endpoint is private. Do not share its URL.</p>"
-    )
+def _validate_local_file(path_text: str, allowed_suffixes: set[str]) -> Path:
+    path = Path(path_text).expanduser().resolve()
+    if not path.is_file():
+        raise ValueError(f"Attachment/local file does not exist: {path}")
+    if path.suffix.lower() not in allowed_suffixes:
+        raise ValueError(f"Unsupported file type {path.suffix}; allowed: {sorted(allowed_suffixes)}")
+    if path.stat().st_size > MAX_UPLOAD_MB * 1024 * 1024:
+        raise ValueError(f"File exceeds MAX_UPLOAD_MB={MAX_UPLOAD_MB}: {path.name}")
+    return path
 
 
-@mcp.custom_route(f"/upload/{MCP_PATH_SECRET}", methods=["GET"])
-async def upload_page(request: Request):
-    return HTMLResponse(
-        """
-<!doctype html>
-<html lang="zh-CN">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>RunningHub 上传</title>
-  <style>
-    body { font-family: system-ui, sans-serif; max-width: 720px; margin: 40px auto; padding: 0 18px; }
-    label { display:block; margin:18px 0 6px; font-weight:600; }
-    button { margin-top:22px; padding:10px 18px; }
-    .note { color:#555; line-height:1.6; }
-  </style>
-</head>
-<body>
-  <h2>上传人物参考图 + 素材视频</h2>
-  <p class="note">文件会直接转发到 RunningHub。上传成功后，可把两个 filename 复制到 ChatGPT 调用换人工具。</p>
-  <form method="post" enctype="multipart/form-data">
-    <label>人物参考图</label>
-    <input name="image" type="file" accept="image/*" required />
-    <label>素材视频</label>
-    <input name="video" type="file" accept="video/*" required />
-    <br/><button type="submit">上传到 RunningHub</button>
-  </form>
-</body>
-</html>
-        """
-    )
-
-
-@mcp.custom_route(f"/upload/{MCP_PATH_SECRET}", methods=["POST"])
-async def upload_pair(request: Request):
+async def _validate_public_https_url(url: str) -> None:
+    parsed = urlparse(url)
+    if parsed.scheme.lower() != "https" or not parsed.hostname:
+        raise ValueError("Remote media input must be an HTTPS URL")
+    if parsed.username or parsed.password:
+        raise ValueError("Remote media URL must not contain embedded credentials")
     try:
-        form = await request.form()
-        image = form.get("image")
-        video = form.get("video")
-
-        if image is None or video is None:
-            return HTMLResponse("Missing image or video", status_code=400)
-
-        image_filename = await upload_to_runninghub(image)
-        video_filename = await upload_to_runninghub(video)
-    except httpx.HTTPStatusError as e:
-        detail = e.response.text[:2000]
-        return HTMLResponse(
-            f"<h3>RunningHub HTTP error</h3><pre>{escape(detail)}</pre>",
-            status_code=502,
+        addresses = await asyncio.get_running_loop().getaddrinfo(
+            parsed.hostname,
+            parsed.port or 443,
+            type=socket.SOCK_STREAM,
         )
-    except Exception as e:
-        return HTMLResponse(
-            f"<h3>Upload failed</h3><pre>{escape(str(e))}</pre>",
-            status_code=500,
+    except socket.gaierror as exc:
+        raise ValueError(f"Unable to resolve remote media host: {parsed.hostname}") from exc
+    if not addresses:
+        raise ValueError(f"Unable to resolve remote media host: {parsed.hostname}")
+    for address in addresses:
+        ip = ipaddress.ip_address(address[4][0])
+        if not ip.is_global:
+            raise ValueError(f"Remote media host resolves to a non-public address: {ip}")
+
+
+def _remote_suffix(response: httpx.Response, url: str, allowed_suffixes: set[str]) -> str:
+    disposition = response.headers.get("content-disposition", "")
+    match = re.search(r"filename\*=UTF-8''([^;]+)|filename=\"?([^\";]+)", disposition, re.I)
+    names = []
+    if match:
+        names.append(unquote(match.group(1) or match.group(2) or ""))
+    names.append(unquote(Path(urlparse(url).path).name))
+    for name in names:
+        suffix = Path(name).suffix.lower()
+        if suffix in allowed_suffixes:
+            return suffix
+    content_type = response.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+    suffix = CONTENT_TYPE_SUFFIXES.get(content_type, "")
+    if suffix in allowed_suffixes:
+        return suffix
+    if content_type.startswith("text/") or content_type in {"application/json", "application/xml"}:
+        raise ValueError(f"Remote URL returned {content_type}, not a supported media file")
+    return ".jpg" if allowed_suffixes == IMAGE_SUFFIXES else ".mp4"
+
+
+async def _download_external_input(
+    url: str,
+    destination_stem: Path,
+    allowed_suffixes: set[str],
+) -> Path:
+    current_url = url.strip()
+    async with _public_client() as client:
+        for _ in range(6):
+            await _validate_public_https_url(current_url)
+            request = client.build_request("GET", current_url)
+            response = await client.send(request, stream=True)
+            if response.is_redirect:
+                location = response.headers.get("location")
+                await response.aclose()
+                if not location:
+                    raise ValueError("Remote media redirect did not include a location")
+                current_url = urljoin(current_url, location)
+                continue
+            try:
+                response.raise_for_status()
+                declared_size = int(response.headers.get("content-length") or 0)
+                maximum = MAX_UPLOAD_MB * 1024 * 1024
+                if declared_size > maximum:
+                    raise ValueError(f"Remote file exceeds MAX_UPLOAD_MB={MAX_UPLOAD_MB}")
+                suffix = _remote_suffix(response, current_url, allowed_suffixes)
+                destination = destination_stem.with_suffix(suffix)
+                temporary = destination.with_suffix(destination.suffix + ".part")
+                total = 0
+                try:
+                    with temporary.open("wb") as handle:
+                        async for chunk in response.aiter_bytes(1024 * 1024):
+                            total += len(chunk)
+                            if total > maximum:
+                                raise ValueError(f"Remote file exceeds MAX_UPLOAD_MB={MAX_UPLOAD_MB}")
+                            handle.write(chunk)
+                    if total == 0:
+                        raise ValueError("Remote media file is empty")
+                    temporary.replace(destination)
+                except Exception:
+                    temporary.unlink(missing_ok=True)
+                    raise
+                return destination
+            finally:
+                await response.aclose()
+    raise ValueError("Remote media URL exceeded the redirect limit")
+
+
+async def _ingest_input(
+    value: OpenAIFile | str,
+    destination_stem: Path,
+    allowed_suffixes: set[str],
+) -> Path:
+    if isinstance(value, OpenAIFile):
+        declared_type = (value.mime_type or "").strip().lower()
+        expected_prefix = "image/" if allowed_suffixes == IMAGE_SUFFIXES else "video/"
+        if declared_type and not declared_type.startswith(expected_prefix):
+            raise ValueError(
+                f"Attachment {value.file_name or value.file_id} has MIME type "
+                f"{value.mime_type}; expected {expected_prefix.rstrip('/')}"
+            )
+        return await _download_external_input(
+            value.download_url,
+            destination_stem,
+            allowed_suffixes,
         )
 
-    return HTMLResponse(
-        f"""
-<!doctype html>
-<html lang="zh-CN">
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
-<body style="font-family:system-ui,sans-serif;max-width:760px;margin:40px auto;padding:0 18px">
-  <h2>上传成功</h2>
-  <p>把下面两项完整复制回 ChatGPT：</p>
-  <p><b>image_filename</b><br><code>{escape(image_filename)}</code></p>
-  <p><b>video_filename</b><br><code>{escape(video_filename)}</code></p>
-</body>
-</html>
-        """
-    )
+    value = value.strip()
+    if value.lower().startswith(("https://", "http://")):
+        return await _download_external_input(value, destination_stem, allowed_suffixes)
+    source = _validate_local_file(value, allowed_suffixes)
+    destination = destination_stem.with_suffix(source.suffix.lower())
+    if source != destination:
+        await asyncio.to_thread(shutil.copy2, source, destination)
+    return destination
+
+
+async def _upload_file(path: Path) -> dict[str, Any]:
+    endpoint = f"{RUNNINGHUB_BASE_URL}/openapi/v2/media/upload/binary"
+    mime = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+    async with _client() as client:
+        with path.open("rb") as handle:
+            response = await client.post(endpoint, files={"file": (path.name, handle, mime)})
+        response.raise_for_status()
+        data = _unwrap_response(response.json())
+    file_name = data.get("fileName") or data.get("file_name")
+    if not file_name:
+        raise RuntimeError(f"RunningHub upload returned no fileName for {path.name}")
+    return {
+        "fileName": file_name,
+        "download_url": data.get("download_url") or data.get("downloadUrl"),
+        "type": data.get("type") or data.get("fileType"),
+        "size": data.get("size"),
+    }
+
+
+async def _submit_app(webapp_id: str, overrides: list[dict[str, Any]]) -> dict[str, Any]:
+    endpoint = f"{RUNNINGHUB_BASE_URL}/task/openapi/ai-app/run"
+    body = {
+        "webappId": webapp_id,
+        "apiKey": RUNNINGHUB_API_KEY,
+        "nodeInfoList": overrides,
+    }
+    async with _client() as client:
+        response = await client.post(endpoint, json=body)
+        response.raise_for_status()
+        data = _unwrap_response(response.json())
+    task_id = str(data.get("taskId") or "")
+    if not task_id:
+        raise RuntimeError(f"RunningHub accepted no taskId for AI App {webapp_id}")
+    node_errors: dict[str, Any] = {}
+    prompt_tips = data.get("promptTips")
+    if isinstance(prompt_tips, str):
+        try:
+            node_errors = json.loads(prompt_tips).get("node_errors") or {}
+        except (json.JSONDecodeError, AttributeError):
+            pass
+    if node_errors:
+        raise RuntimeError(f"RunningHub workflow node validation failed: {node_errors}")
+    return {"task_id": task_id, "task_status": data.get("taskStatus"), "raw": data}
+
+
+async def _query_task(task_id: str) -> dict[str, Any]:
+    endpoint = f"{RUNNINGHUB_BASE_URL}/openapi/v2/query"
+    async with _client() as client:
+        response = await client.post(endpoint, json={"taskId": task_id})
+        response.raise_for_status()
+        payload = response.json()
+    if "code" in payload and payload.get("code") in (804, 813):
+        return {"status": "RUNNING" if payload.get("code") == 804 else "QUEUED", "results": []}
+    if "code" in payload and payload.get("code") == 805:
+        return {"status": "FAILED", "error": payload.get("msg") or payload.get("data")}
+    data = _unwrap_response(payload)
+    status = str(data.get("status") or data.get("taskStatus") or "UNKNOWN").upper()
+    return {
+        "status": status,
+        "results": data.get("results") or data.get("data") or [],
+        "error": data.get("errorMessage") or data.get("failedReason") or data.get("errorCode"),
+        "raw": data,
+    }
+
+
+def _video_results(results: Any) -> list[dict[str, Any]]:
+    if isinstance(results, dict):
+        results = [results]
+    if not isinstance(results, list):
+        return []
+    videos = []
+    for item in results:
+        if isinstance(item, str):
+            item = {"url": item}
+        if not isinstance(item, dict):
+            continue
+        url = str(item.get("url") or item.get("fileUrl") or item.get("download_url") or "")
+        output_type = str(item.get("outputType") or item.get("type") or "").lower()
+        if url and (output_type in {"mp4", "mov", "video"} or url.lower().split("?")[0].endswith((".mp4", ".mov", ".webm"))):
+            videos.append(dict(item, url=url))
+    return videos
+
+
+async def _download(url: str, destination: Path) -> Path:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_suffix(destination.suffix + ".part")
+    total = 0
+    async with _public_client(follow_redirects=True) as client:
+        async with client.stream("GET", url) as response:
+            response.raise_for_status()
+            with temporary.open("wb") as handle:
+                async for chunk in response.aiter_bytes(1024 * 1024):
+                    total += len(chunk)
+                    if total > MAX_DOWNLOAD_MB * 1024 * 1024:
+                        raise ValueError(f"Download exceeds MAX_DOWNLOAD_MB={MAX_DOWNLOAD_MB}")
+                    handle.write(chunk)
+    temporary.replace(destination)
+    return destination
+
+
+def _pipeline_dir(pipeline_id: str) -> Path:
+    try:
+        normalized = str(uuid.UUID(pipeline_id))
+    except ValueError as exc:
+        raise ValueError("Invalid pipeline_id") from exc
+    path = PIPELINES_DIR / normalized
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _state_path(pipeline_id: str) -> Path:
+    return _pipeline_dir(pipeline_id) / "state.json"
+
+
+def _load_state(pipeline_id: str) -> dict[str, Any]:
+    path = _state_path(pipeline_id)
+    if not path.is_file():
+        raise ValueError(f"Unknown pipeline_id: {pipeline_id}")
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _save_state(state: dict[str, Any]) -> None:
+    state["updated_at"] = time.time()
+    path = _state_path(str(state["pipeline_id"]))
+    temporary = path.with_suffix(".json.tmp")
+    temporary.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    temporary.replace(path)
+
+
+def _state_for_user(state: dict[str, Any]) -> dict[str, Any]:
+    keep = {
+        "pipeline_id", "status", "stage", "created_at", "updated_at",
+        "stage1_task_id", "stage2_task_id", "stage1_results", "stage2_results",
+        "final_video_url", "final_runninghub_upload_url", "warning", "error",
+        "preserve_original_audio_and_duration", "source_video_info", "bernini_frame_count",
+    }
+    result = {key: value for key, value in state.items() if key in keep and value not in (None, "", [])}
+    if state.get("status") in {"stage1_running", "stage2_running"}:
+        result["next_action"] = "Call wait_person_background_replacement or get_person_background_replacement"
+    return result
+
+
+def _active_pipeline() -> dict[str, Any] | None:
+    for path in sorted(PIPELINES_DIR.glob("*/state.json"), reverse=True):
+        try:
+            state = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if state.get("status") in {
+            "receiving_inputs", "uploading", "stage1_running", "stage2_running", "stage2_preparing"
+        }:
+            return state
+    return None
+
+
+def _ffprobe_duration(path: Path) -> float:
+    duration = float(_ffprobe_video_info(path)["duration_seconds"])
+    if duration <= 0:
+        raise ValueError("Source video has no positive duration")
+    return duration
+
+
+def _ffprobe_video_info(path: Path) -> dict[str, Any]:
+    command = [
+        "ffprobe", "-v", "error", "-select_streams", "v:0",
+        "-show_entries", "stream=avg_frame_rate,r_frame_rate,nb_frames,duration:format=duration",
+        "-of", "json", str(path),
+    ]
+    payload = json.loads(subprocess.check_output(command, text=True, timeout=30))
+    streams = payload.get("streams") or []
+    if not streams:
+        raise ValueError("Source file contains no video stream")
+    stream = streams[0]
+    duration = float(stream.get("duration") or payload.get("format", {}).get("duration") or 0)
+    rate_text = str(stream.get("avg_frame_rate") or stream.get("r_frame_rate") or "0/1")
+    try:
+        fps = float(Fraction(rate_text))
+    except (ValueError, ZeroDivisionError):
+        fps = 0.0
+    raw_frames = stream.get("nb_frames")
+    frame_count = int(raw_frames) if str(raw_frames or "").isdigit() else round(duration * fps)
+    if duration <= 0 or fps <= 0 or frame_count <= 0:
+        raise ValueError(
+            f"Unable to determine video timing: duration={duration}, fps={fps}, frames={frame_count}"
+        )
+    return {
+        "duration_seconds": duration,
+        "fps": fps,
+        "frame_count": frame_count,
+    }
+
+
+def _bernini_frame_count(source_frame_count: int) -> int:
+    capped = min(max(1, source_frame_count), BERNINI_MAX_FRAMES)
+    if BERNINI_FRAME_MULTIPLE == 1:
+        return capped
+    candidate = capped - ((capped - BERNINI_FRAME_OFFSET) % BERNINI_FRAME_MULTIPLE)
+    if candidate <= 0:
+        candidate = min(capped, max(1, BERNINI_FRAME_OFFSET))
+    return candidate
+
+
+def _restore_audio_and_duration(raw_video: Path, source_video: Path, output: Path) -> None:
+    duration = _ffprobe_duration(source_video)
+    command = [
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+        "-i", str(raw_video), "-i", str(source_video),
+        "-filter_complex", f"[0:v]tpad=stop_mode=clone:stop_duration={duration:.6f}[v]",
+        "-map", "[v]", "-map", "1:a:0?", "-t", f"{duration:.6f}",
+        "-c:v", "libx264", "-preset", "medium", "-crf", "18",
+        "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k",
+        "-movflags", "+faststart", str(output),
+    ]
+    subprocess.run(command, check=True, timeout=1800)
+
+
+async def _finalize_stage2(state: dict[str, Any], videos: list[dict[str, Any]]) -> dict[str, Any]:
+    state["stage2_results"] = videos
+    state["status"] = "completed"
+    state["stage"] = 2
+    state["final_video_url"] = videos[0]["url"]
+    if not state.get("preserve_original_audio_and_duration"):
+        _save_state(state)
+        return state
+
+    pipeline_dir = _pipeline_dir(state["pipeline_id"])
+    source_video = pipeline_dir / str(state.get("source_original_name", "source_original.mp4"))
+    raw_video = pipeline_dir / "stage2_raw.mp4"
+    final_video = pipeline_dir / "final.mp4"
+    try:
+        await _download(videos[0]["url"], raw_video)
+        await asyncio.to_thread(_restore_audio_and_duration, raw_video, source_video, final_video)
+        uploaded = await _upload_file(final_video)
+        state["final_runninghub_upload_url"] = uploaded.get("download_url")
+        if PUBLIC_BASE_URL:
+            state["final_video_url"] = f"{PUBLIC_BASE_URL}/files/{state['pipeline_id']}/final.mp4"
+        elif uploaded.get("download_url"):
+            state["final_video_url"] = uploaded["download_url"]
+        else:
+            state["warning"] = "Final video is stored locally; set PUBLIC_BASE_URL to expose it"
+    except Exception as exc:  # Preserve the successful Bernini output on post-processing failure.
+        state["warning"] = f"Background replacement succeeded, but final audio/duration restoration failed: {exc}"
+    finally:
+        if raw_video.exists() and not KEEP_INTERMEDIATE_FILES:
+            raw_video.unlink(missing_ok=True)
+    _save_state(state)
+    return state
+
+
+async def _advance_pipeline(state: dict[str, Any]) -> dict[str, Any]:
+    status = state.get("status")
+    if status == "stage1_running":
+        query = await _query_task(state["stage1_task_id"])
+        remote_status = query["status"]
+        if remote_status in {"FAILED", "ERROR", "CANCELLED", "CANCELED"}:
+            state.update(status="stage1_failed", error=query.get("error") or query.get("raw"))
+            _save_state(state)
+            return state
+        if remote_status != "SUCCESS":
+            return state
+        videos = _video_results(query.get("results"))
+        if not videos:
+            state.update(status="stage1_failed", error="SCAIL task succeeded but returned no video")
+            _save_state(state)
+            return state
+        state["stage1_results"] = videos
+        output_index = int(state.get("stage1_output_index", 0))
+        if output_index >= len(videos):
+            state.update(
+                status="stage1_failed",
+                error=f"stage1_output_index={output_index}, but SCAIL returned {len(videos)} video(s)",
+            )
+            _save_state(state)
+            return state
+        state["status"] = "stage2_preparing"
+        _save_state(state)
+
+        pipeline_dir = _pipeline_dir(state["pipeline_id"])
+        stage1_video = pipeline_dir / "stage1.mp4"
+        try:
+            await _download(videos[output_index]["url"], stage1_video)
+            stage1_upload = await _upload_file(stage1_video)
+            nodes = await _get_nodes(BERNINI_WEBAPP_ID)
+            mapping = _resolve_stage2(nodes)
+            overrides = [
+                _override(mapping["source_video"], stage1_upload["fileName"]),
+                _override(mapping["background_image"], state["background_upload_file_name"]),
+            ]
+            if mapping["prompt"] is not None:
+                overrides.append(_override(mapping["prompt"], state["stage2_prompt"]))
+            if mapping["frame_count"] is not None and state.get("bernini_frame_count") is not None:
+                overrides.append(
+                    _override(mapping["frame_count"], str(state["bernini_frame_count"]))
+                )
+            submitted = await _submit_app(BERNINI_WEBAPP_ID, overrides)
+            state.update(
+                status="stage2_running",
+                stage=2,
+                stage2_task_id=submitted["task_id"],
+            )
+            _save_state(state)
+        except Exception as exc:
+            state.update(status="stage2_failed", error=f"Unable to submit Bernini stage: {exc}")
+            _save_state(state)
+        finally:
+            if stage1_video.exists() and not KEEP_INTERMEDIATE_FILES:
+                stage1_video.unlink(missing_ok=True)
+        return state
+
+    if status == "stage2_running":
+        query = await _query_task(state["stage2_task_id"])
+        remote_status = query["status"]
+        if remote_status in {"FAILED", "ERROR", "CANCELLED", "CANCELED"}:
+            state.update(status="stage2_failed", error=query.get("error") or query.get("raw"))
+            _save_state(state)
+            return state
+        if remote_status != "SUCCESS":
+            return state
+        videos = _video_results(query.get("results"))
+        if not videos:
+            state.update(status="stage2_failed", error="Bernini task succeeded but returned no video")
+            _save_state(state)
+            return state
+        return await _finalize_stage2(state, videos)
+    return state
 
 
 @mcp.custom_route("/health", methods=["GET"])
-async def health(request: Request):
-    return PlainTextResponse("ok")
+async def health(_: Request) -> JSONResponse:
+    return JSONResponse(
+        {
+            "ok": True,
+            "service": "runninghub-person-background-mcp",
+            "api_key_configured": bool(RUNNINGHUB_API_KEY),
+            "scail_webapp_id": SCAIL_WEBAPP_ID,
+            "bernini_webapp_id": BERNINI_WEBAPP_ID,
+        }
+    )
+
+
+@mcp.custom_route("/files/{pipeline_id}/final.mp4", methods=["GET"])
+async def serve_final(request: Request) -> FileResponse | JSONResponse:
+    pipeline_id = request.path_params["pipeline_id"]
+    try:
+        path = _pipeline_dir(pipeline_id) / "final.mp4"
+    except ValueError:
+        return JSONResponse({"error": "invalid pipeline id"}, status_code=404)
+    if not path.is_file():
+        return JSONResponse({"error": "final video not found"}, status_code=404)
+    return FileResponse(path, media_type="video/mp4", filename=f"{pipeline_id}-final.mp4")
+
+
+@mcp.tool(
+    description=(
+        "只读检查 SCAIL 与 Bernini-R 两个 RunningHub 应用的可调用节点和自动映射结果。"
+        "不会创建任务或消耗 RH。部署后应先调用一次。"
+    )
+)
+async def inspect_person_background_pipeline(force_refresh: bool = False) -> dict[str, Any]:
+    stage1_nodes, stage2_nodes = await asyncio.gather(
+        _get_nodes(SCAIL_WEBAPP_ID, force_refresh),
+        _get_nodes(BERNINI_WEBAPP_ID, force_refresh),
+    )
+    stage1 = _resolve_stage1(stage1_nodes)
+    stage2 = _resolve_stage2(stage2_nodes)
+    return {
+        "connected": True,
+        "rh_charge": False,
+        "stage1": {
+            "webapp_id": SCAIL_WEBAPP_ID,
+            "resolved": {key: _public_node(value) for key, value in stage1.items()},
+            "all_nodes": [_public_node(node) for node in stage1_nodes],
+        },
+        "stage2": {
+            "webapp_id": BERNINI_WEBAPP_ID,
+            "resolved": {key: _public_node(value) for key, value in stage2.items()},
+            "all_nodes": [_public_node(node) for node in stage2_nodes],
+        },
+    }
+
+
+@mcp.tool(
+    meta={
+        "openai/fileParams": [
+            "reference_person_image_file",
+            "source_video_file",
+            "background_image_file",
+        ]
+    },
+    annotations={
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": True,
+    },
+    description=(
+        "直接使用 ChatGPT 的人物参考图、原视频和背景图附件启动两阶段替换任务。"
+        "ChatGPT 会把附件的临时下载地址安全传给 Railway，Railway 不再读取 ChatGPT 本地路径。"
+        "第一阶段 SCAIL 换人，成功后自动由 Bernini-R 换背景；会消耗两次 RunningHub RH，"
+        "必须显式确认 confirm_rh_charge=true。服务器会自动读取原视频帧数并设置 Bernini 总帧数。"
+    )
+)
+async def submit_person_background_replacement_from_chatgpt_attachments(
+    reference_person_image_file: OpenAIFile,
+    source_video_file: OpenAIFile,
+    background_image_file: OpenAIFile,
+    confirm_rh_charge: Annotated[
+        bool,
+        Field(description="必须为 true，确认同意 SCAIL 与 Bernini-R 两阶段均会消耗 RH"),
+    ],
+    stage1_prompt: str = DEFAULT_STAGE1_PROMPT,
+    stage2_prompt: str = DEFAULT_STAGE2_PROMPT,
+    stage1_output_index: Annotated[int, Field(ge=0, le=10)] = 0,
+    preserve_original_audio_and_duration: bool = True,
+) -> dict[str, Any]:
+    if not confirm_rh_charge:
+        raise ValueError("RH charge was not confirmed; set confirm_rh_charge=true to submit")
+    _require_api_key()
+    if not ALLOW_CONCURRENT_PIPELINES:
+        active = _active_pipeline()
+        if active:
+            raise RuntimeError(
+                f"Pipeline {active['pipeline_id']} is still active ({active['status']}). "
+                "Finish/query it before starting another, or set ALLOW_CONCURRENT_PIPELINES=true."
+            )
+
+    pipeline_id = str(uuid.uuid4())
+    pipeline_dir = _pipeline_dir(pipeline_id)
+    state: dict[str, Any] = {
+        "pipeline_id": pipeline_id,
+        "status": "receiving_inputs",
+        "stage": 1,
+        "created_at": time.time(),
+        "updated_at": time.time(),
+        "stage1_prompt": stage1_prompt,
+        "stage2_prompt": stage2_prompt,
+        "stage1_output_index": stage1_output_index,
+        "preserve_original_audio_and_duration": preserve_original_audio_and_duration,
+    }
+    _save_state(state)
+
+    try:
+        person, source, background = await asyncio.gather(
+            _ingest_input(reference_person_image_file, pipeline_dir / "person_reference", IMAGE_SUFFIXES),
+            _ingest_input(source_video_file, pipeline_dir / "source_original", VIDEO_SUFFIXES),
+            _ingest_input(background_image_file, pipeline_dir / "background_reference", IMAGE_SUFFIXES),
+        )
+        source_info = await asyncio.to_thread(_ffprobe_video_info, source)
+        frame_count = _bernini_frame_count(int(source_info["frame_count"]))
+        state.update(
+            status="uploading",
+            source_original_name=source.name,
+            source_video_info=source_info,
+            bernini_frame_count=frame_count,
+        )
+        _save_state(state)
+        person_upload, source_upload, background_upload = await asyncio.gather(
+            _upload_file(person), _upload_file(source), _upload_file(background)
+        )
+        nodes = await _get_nodes(SCAIL_WEBAPP_ID)
+        mapping = _resolve_stage1(nodes)
+        overrides = [
+            _override(mapping["person_image"], person_upload["fileName"]),
+            _override(mapping["source_video"], source_upload["fileName"]),
+        ]
+        if mapping["prompt"] is not None:
+            overrides.append(_override(mapping["prompt"], stage1_prompt))
+        submitted = await _submit_app(SCAIL_WEBAPP_ID, overrides)
+        state.update(
+            status="stage1_running",
+            stage1_task_id=submitted["task_id"],
+            background_upload_file_name=background_upload["fileName"],
+        )
+        _save_state(state)
+        return _state_for_user(state)
+    except Exception as exc:
+        state.update(status="stage1_failed", error=str(exc))
+        _save_state(state)
+        raise
+
+
+finalize_openai_file_param_schema(
+    "submit_person_background_replacement_from_chatgpt_attachments",
+    "reference_person_image_file",
+    "source_video_file",
+    "background_image_file",
+)
+
+
+@mcp.tool(
+    description=(
+        "查询并推进两阶段换人换背景任务。SCAIL 成功后会使用已授权的 RH 自动提交 Bernini-R；"
+        "最终返回背景替换视频链接。"
+    )
+)
+async def get_person_background_replacement(pipeline_id: str) -> dict[str, Any]:
+    async with _state_lock:
+        state = _load_state(pipeline_id)
+        state = await _advance_pipeline(state)
+        return _state_for_user(state)
+
+
+@mcp.tool(
+    description=(
+        "等待两阶段换人换背景任务完成。最长可等待 900 秒；超时会返回 pipeline_id，之后可继续调用。"
+    )
+)
+async def wait_person_background_replacement(
+    pipeline_id: str,
+    timeout_seconds: Annotated[int, Field(ge=10, le=900)] = 900,
+    poll_interval_seconds: Annotated[int, Field(ge=5, le=60)] = 20,
+) -> dict[str, Any]:
+    deadline = time.monotonic() + timeout_seconds
+    terminal = {"completed", "stage1_failed", "stage2_failed"}
+    while time.monotonic() < deadline:
+        async with _state_lock:
+            state = _load_state(pipeline_id)
+            state = await _advance_pipeline(state)
+        if state.get("status") in terminal:
+            return _state_for_user(state)
+        await asyncio.sleep(poll_interval_seconds)
+    state = _load_state(pipeline_id)
+    result = _state_for_user(state)
+    result["wait_timed_out"] = True
+    return result
+
+
+@mcp.tool(description="列出 Railway Volume 中最近的换人换背景任务；不会消耗 RH。")
+async def list_person_background_replacements(limit: Annotated[int, Field(ge=1, le=100)] = 20) -> list[dict[str, Any]]:
+    states: list[dict[str, Any]] = []
+    for path in PIPELINES_DIR.glob("*/state.json"):
+        try:
+            states.append(json.loads(path.read_text(encoding="utf-8")))
+        except (OSError, json.JSONDecodeError):
+            continue
+    states.sort(key=lambda item: item.get("updated_at", 0), reverse=True)
+    return [_state_for_user(state) for state in states[:limit]]
+
+
+def main() -> None:
+    port = int(os.getenv("PORT", "8000"))
+    mcp.run(transport="http", host="0.0.0.0", port=port, path="/mcp")
 
 
 if __name__ == "__main__":
-    mcp.run(
-        transport="http",
-        host="0.0.0.0",
-        port=PORT,
-        path=f"/mcp/{MCP_PATH_SECRET}/",
-    )
+    main()
