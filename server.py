@@ -651,6 +651,7 @@ def _state_for_user(state: dict[str, Any]) -> dict[str, Any]:
     keep = {
         "pipeline_id", "status", "stage", "created_at", "updated_at",
         "stage1_task_id", "stage2_task_id", "stage1_results", "stage2_results",
+        "stage1_output_index", "stage2_attempts",
         "final_video_url", "final_runninghub_upload_url", "warning", "error",
         "preserve_original_audio_and_duration", "source_video_info", "bernini_frame_count",
     }
@@ -767,6 +768,63 @@ async def _finalize_stage2(state: dict[str, Any], videos: list[dict[str, Any]]) 
     return state
 
 
+async def _submit_stage2_from_existing_results(
+    state: dict[str, Any],
+    output_index: int,
+) -> dict[str, Any]:
+    """Submit only Bernini-R using a stored successful SCAIL output."""
+
+    videos = state.get("stage1_results")
+    if not isinstance(videos, list) or not videos:
+        raise ValueError("This pipeline has no successful SCAIL video to reuse")
+    if output_index < 0 or output_index >= len(videos):
+        raise ValueError(
+            f"stage1_output_index={output_index}, but SCAIL returned {len(videos)} video(s)"
+        )
+    background_file_name = str(state.get("background_upload_file_name") or "").strip()
+    if not background_file_name:
+        raise ValueError("This pipeline has no uploaded background image to reuse")
+
+    state.update(
+        status="stage2_preparing",
+        stage=2,
+        stage1_output_index=output_index,
+    )
+    _save_state(state)
+
+    pipeline_dir = _pipeline_dir(state["pipeline_id"])
+    stage1_video = pipeline_dir / f"stage1-retry-{output_index}.mp4"
+    try:
+        await _download(str(videos[output_index]["url"]), stage1_video)
+        stage1_upload = await _upload_file(stage1_video)
+        nodes = await _get_nodes(BERNINI_WEBAPP_ID)
+        mapping = _resolve_stage2(nodes)
+        overrides = [
+            _override(mapping["source_video"], stage1_upload["fileName"]),
+            _override(mapping["background_image"], background_file_name),
+        ]
+        if mapping["prompt"] is not None:
+            overrides.append(_override(mapping["prompt"], state["stage2_prompt"]))
+        if mapping["frame_count"] is not None and state.get("bernini_frame_count") is not None:
+            overrides.append(
+                _override(mapping["frame_count"], str(state["bernini_frame_count"]))
+            )
+        submitted = await _submit_app(BERNINI_WEBAPP_ID, overrides)
+        state.update(
+            status="stage2_running",
+            stage=2,
+            stage2_task_id=submitted["task_id"],
+        )
+        _save_state(state)
+    except Exception as exc:
+        state.update(status="stage2_failed", error=f"Unable to submit Bernini stage: {exc}")
+        _save_state(state)
+    finally:
+        if stage1_video.exists() and not KEEP_INTERMEDIATE_FILES:
+            stage1_video.unlink(missing_ok=True)
+    return state
+
+
 async def _advance_pipeline(state: dict[str, Any]) -> dict[str, Any]:
     status = state.get("status")
     if status == "stage1_running":
@@ -792,40 +850,7 @@ async def _advance_pipeline(state: dict[str, Any]) -> dict[str, Any]:
             )
             _save_state(state)
             return state
-        state["status"] = "stage2_preparing"
-        _save_state(state)
-
-        pipeline_dir = _pipeline_dir(state["pipeline_id"])
-        stage1_video = pipeline_dir / "stage1.mp4"
-        try:
-            await _download(videos[output_index]["url"], stage1_video)
-            stage1_upload = await _upload_file(stage1_video)
-            nodes = await _get_nodes(BERNINI_WEBAPP_ID)
-            mapping = _resolve_stage2(nodes)
-            overrides = [
-                _override(mapping["source_video"], stage1_upload["fileName"]),
-                _override(mapping["background_image"], state["background_upload_file_name"]),
-            ]
-            if mapping["prompt"] is not None:
-                overrides.append(_override(mapping["prompt"], state["stage2_prompt"]))
-            if mapping["frame_count"] is not None and state.get("bernini_frame_count") is not None:
-                overrides.append(
-                    _override(mapping["frame_count"], str(state["bernini_frame_count"]))
-                )
-            submitted = await _submit_app(BERNINI_WEBAPP_ID, overrides)
-            state.update(
-                status="stage2_running",
-                stage=2,
-                stage2_task_id=submitted["task_id"],
-            )
-            _save_state(state)
-        except Exception as exc:
-            state.update(status="stage2_failed", error=f"Unable to submit Bernini stage: {exc}")
-            _save_state(state)
-        finally:
-            if stage1_video.exists() and not KEEP_INTERMEDIATE_FILES:
-                stage1_video.unlink(missing_ok=True)
-        return state
+        return await _submit_stage2_from_existing_results(state, output_index)
 
     if status == "stage2_running":
         query = await _query_task(state["stage2_task_id"])
@@ -1017,6 +1042,80 @@ async def get_person_background_replacement(pipeline_id: str) -> dict[str, Any]:
     async with _state_lock:
         state = _load_state(pipeline_id)
         state = await _advance_pipeline(state)
+        return _state_for_user(state)
+
+
+@mcp.tool(
+    description=(
+        "仅重试失败流水线的 Bernini-R 背景替换阶段。复用已经成功的 SCAIL 人物视频和背景图，"
+        "不会重新运行或扣费 SCAIL；会消耗一次新的 Bernini-R RH，必须显式确认 "
+        "confirm_rh_charge=true。stage1_output_index=-1 时自动改用下一条 SCAIL 候选视频。"
+    ),
+    annotations={
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": True,
+    },
+)
+async def retry_background_replacement_only(
+    pipeline_id: str,
+    confirm_rh_charge: Annotated[
+        bool,
+        Field(description="必须为 true，确认本次仅重新消耗一次 Bernini-R RH"),
+    ],
+    stage1_output_index: Annotated[int, Field(ge=-1, le=10)] = -1,
+    bernini_frame_count: Annotated[int, Field(ge=0, le=4097)] = 0,
+    stage2_prompt: str = "",
+) -> dict[str, Any]:
+    if not confirm_rh_charge:
+        raise ValueError("RH charge was not confirmed; set confirm_rh_charge=true to retry")
+    _require_api_key()
+
+    async with _state_lock:
+        state = _load_state(pipeline_id)
+        if state.get("status") != "stage2_failed":
+            raise ValueError(
+                "Only a pipeline with status=stage2_failed can retry the background stage"
+            )
+        videos = state.get("stage1_results")
+        if not isinstance(videos, list) or not videos:
+            raise ValueError("This pipeline has no successful SCAIL video to reuse")
+
+        if stage1_output_index == -1:
+            previous_index = int(state.get("stage1_output_index", 0))
+            selected_index = (previous_index + 1) % len(videos)
+        else:
+            selected_index = stage1_output_index
+        if selected_index >= len(videos):
+            raise ValueError(
+                f"stage1_output_index={selected_index}, but SCAIL returned {len(videos)} video(s)"
+            )
+
+        attempts = state.setdefault("stage2_attempts", [])
+        attempts.append(
+            {
+                "task_id": state.get("stage2_task_id"),
+                "status": state.get("status"),
+                "error": state.get("error"),
+                "stage1_output_index": state.get("stage1_output_index", 0),
+                "ended_at": time.time(),
+            }
+        )
+        if stage2_prompt.strip():
+            state["stage2_prompt"] = stage2_prompt.strip()
+        if bernini_frame_count > 0:
+            state["bernini_frame_count"] = _bernini_frame_count(bernini_frame_count)
+        for key in (
+            "stage2_results",
+            "final_video_url",
+            "final_runninghub_upload_url",
+            "warning",
+            "error",
+        ):
+            state.pop(key, None)
+
+        state = await _submit_stage2_from_existing_results(state, selected_index)
         return _state_for_user(state)
 
 
