@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
+import hashlib
 import json
 import mimetypes
 import os
@@ -12,7 +15,7 @@ import time
 import uuid
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 import httpx
 from mcp.server.fastmcp import FastMCP
@@ -22,6 +25,7 @@ from starlette.responses import FileResponse, JSONResponse, Response
 
 
 RH_BASE_URL = os.getenv("RUNNINGHUB_BASE_URL", "https://www.runninghub.cn").rstrip("/")
+SERVICE_VERSION = "2026.09.01-chunked-upload-v1"
 RH_API_KEY = os.getenv("RUNNINGHUB_API_KEY", "").strip()
 SCAIL_WEBAPP_ID = os.getenv("SCAIL_WEBAPP_ID", "2064610888811900929").strip()
 VACE_WEBAPP_ID = os.getenv("VACE_WEBAPP_ID", "2035730491302744066").strip()
@@ -29,12 +33,19 @@ PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
 RAILWAY_PUBLIC_DOMAIN = os.getenv("RAILWAY_PUBLIC_DOMAIN", "").strip()
 DATA_DIR = Path(os.getenv("DATA_DIR", "/data")).resolve()
 JOBS_DIR = DATA_DIR / "jobs"
+UPLOADS_DIR = DATA_DIR / "uploads"
 STATE_FILE = DATA_DIR / "pipelines.json"
 MAX_INPUT_BYTES = int(os.getenv("MAX_INPUT_BYTES", str(500 * 1024 * 1024)))
 HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT_SECONDS", "120"))
+UPLOAD_CHUNK_BYTES = min(
+    max(int(os.getenv("UPLOAD_CHUNK_BYTES", "180000")), 64 * 1024),
+    1024 * 1024,
+)
+UPLOAD_TTL_SECONDS = max(int(os.getenv("UPLOAD_TTL_SECONDS", "86400")), 3600)
 
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 JOBS_DIR.mkdir(parents=True, exist_ok=True)
+UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
 
 _public_host = urlparse(PUBLIC_BASE_URL).netloc or RAILWAY_PUBLIC_DOMAIN
 _allowed_hosts = ["localhost:*", "127.0.0.1:*"]
@@ -65,7 +76,11 @@ mcp = FastMCP(
 )
 
 _state_lock = asyncio.Lock()
+_upload_lock = asyncio.Lock()
 _node_cache: dict[str, tuple[float, list[dict[str, Any]]]] = {}
+
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
+VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v"}
 
 
 def _require_config() -> None:
@@ -115,6 +130,88 @@ def _safe_pipeline_id(value: str) -> str:
     if not re.fullmatch(r"[0-9a-fA-F-]{36}", value):
         raise ValueError("Invalid pipeline_id")
     return value
+
+
+def _safe_upload_id(value: str) -> str:
+    if not re.fullmatch(r"[0-9a-f]{32}", value):
+        raise ValueError("Invalid upload reference")
+    return value
+
+
+def _upload_dir(upload_id: str) -> Path:
+    return UPLOADS_DIR / _safe_upload_id(upload_id)
+
+
+def _upload_manifest_path(upload_id: str) -> Path:
+    return _upload_dir(upload_id) / "manifest.json"
+
+
+def _read_upload_manifest(upload_id: str) -> dict[str, Any]:
+    path = _upload_manifest_path(upload_id)
+    try:
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError) as exc:
+        raise ValueError("Unknown or expired upload reference") from exc
+    if not isinstance(manifest, dict):
+        raise ValueError("Invalid upload manifest")
+    return manifest
+
+
+def _write_upload_manifest(upload_id: str, manifest: dict[str, Any]) -> None:
+    path = _upload_manifest_path(upload_id)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def _make_upload_ref(upload_id: str, token: str) -> str:
+    return f"scail-upload://{upload_id}?token={token}"
+
+
+def _parse_upload_ref(value: str) -> tuple[str, str]:
+    parsed = urlparse(value)
+    if parsed.scheme != "scail-upload":
+        raise ValueError("Not a SCAIL upload reference")
+    upload_id = _safe_upload_id(parsed.netloc or parsed.path.lstrip("/"))
+    token = (parse_qs(parsed.query).get("token") or [""])[0]
+    if not token:
+        raise ValueError("Upload reference is missing its token")
+    return upload_id, token
+
+
+def _verify_upload_token(manifest: dict[str, Any], token: str) -> None:
+    expected = str(manifest.get("token") or "")
+    if not expected or not secrets.compare_digest(expected, token):
+        raise ValueError("Invalid upload token")
+
+
+def _upload_payload_path(upload_id: str, manifest: dict[str, Any]) -> Path:
+    name = str(manifest.get("stored_name") or "")
+    if not name or Path(name).name != name:
+        raise ValueError("Invalid upload manifest filename")
+    return _upload_dir(upload_id) / name
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _remove_expired_uploads_unlocked() -> None:
+    now = time.time()
+    for directory in UPLOADS_DIR.iterdir():
+        if not directory.is_dir() or not re.fullmatch(r"[0-9a-f]{32}", directory.name):
+            continue
+        try:
+            manifest = json.loads((directory / "manifest.json").read_text(encoding="utf-8"))
+            expires_at = float(manifest.get("expires_at") or 0)
+        except (FileNotFoundError, json.JSONDecodeError, OSError, TypeError, ValueError):
+            expires_at = 0
+        if expires_at < now:
+            shutil.rmtree(directory, ignore_errors=True)
 
 
 def _json_response_or_raise(response: httpx.Response) -> dict[str, Any]:
@@ -246,6 +343,22 @@ def _override(node: dict[str, Any], prefix: str, value: Any) -> dict[str, Any]:
 
 async def _materialize_input(value: str, destination: Path) -> Path:
     destination.parent.mkdir(parents=True, exist_ok=True)
+    if value.startswith("scail-upload://"):
+        upload_id, token = _parse_upload_ref(value)
+        async with _upload_lock:
+            manifest = _read_upload_manifest(upload_id)
+            _verify_upload_token(manifest, token)
+            if not manifest.get("ready"):
+                raise ValueError("Upload is not complete")
+            if float(manifest.get("expires_at") or 0) < time.time():
+                raise ValueError("Upload reference has expired")
+            source = _upload_payload_path(upload_id, manifest)
+            if not source.is_file():
+                raise ValueError("Uploaded file is missing")
+            if source.stat().st_size != int(manifest["total_bytes"]):
+                raise ValueError("Uploaded file size no longer matches its manifest")
+            shutil.copy2(source, destination)
+        return destination
     if value.startswith("file://"):
         value = value[7:]
     source = Path(value)
@@ -256,8 +369,8 @@ async def _materialize_input(value: str, destination: Path) -> Path:
     parsed = urlparse(value)
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         raise ValueError(
-            "Attachment is neither a readable server-local file nor an HTTP(S) download URL. "
-            "Reconnect the plugin and attach the file again."
+            "Input must be a completed scail-upload:// reference, a readable server-local file, "
+            "or an HTTP(S) download URL."
         )
     total = 0
     async with httpx.AsyncClient(timeout=httpx.Timeout(HTTP_TIMEOUT, read=600), follow_redirects=True) as client:
@@ -498,8 +611,150 @@ async def inspect_scail_vace_pipeline(force_refresh: bool = False) -> dict[str, 
     return {
         "connected": True,
         "rh_charge": False,
+        "service_version": SERVICE_VERSION,
+        "attachment_upload": {
+            "mode": "chunked_base64",
+            "chunk_size_bytes": UPLOAD_CHUNK_BYTES,
+            "max_input_bytes": MAX_INPUT_BYTES,
+            "ttl_seconds": UPLOAD_TTL_SECONDS,
+        },
         "stage1": {"webapp_id": SCAIL_WEBAPP_ID, "resolved": _resolve_scail(scail_nodes), "all_nodes": scail_nodes},
         "stage2": {"webapp_id": VACE_WEBAPP_ID, "resolved": _resolve_vace(vace_nodes), "all_nodes": vace_nodes},
+    }
+
+
+@mcp.tool()
+async def begin_chatgpt_attachment_upload(
+    file_name: str,
+    media_kind: str,
+    total_bytes: int,
+    sha256_hex: str,
+) -> dict[str, Any]:
+    """Create a resumable Railway upload for one ChatGPT attachment. Does not consume RH.
+
+    Call upload_chatgpt_attachment_chunk repeatedly with the returned upload_ref, then call
+    complete_chatgpt_attachment_upload. media_kind must be image or video.
+    """
+    kind = media_kind.strip().lower()
+    if kind not in {"image", "video"}:
+        raise ValueError("media_kind must be 'image' or 'video'")
+    if total_bytes <= 0 or total_bytes > MAX_INPUT_BYTES:
+        raise ValueError(f"total_bytes must be between 1 and {MAX_INPUT_BYTES}")
+    expected_sha = sha256_hex.strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", expected_sha):
+        raise ValueError("sha256_hex must be a 64-character SHA-256 digest")
+    original_name = Path(file_name).name
+    suffix = Path(original_name).suffix.lower()
+    allowed = IMAGE_EXTENSIONS if kind == "image" else VIDEO_EXTENSIONS
+    if suffix not in allowed:
+        raise ValueError(f"Unsupported {kind} extension: {suffix or '(none)'}")
+    upload_id = uuid.uuid4().hex
+    token = secrets.token_urlsafe(24)
+    stored_name = f"payload{suffix}"
+    now = time.time()
+    manifest: dict[str, Any] = {
+        "upload_id": upload_id,
+        "token": token,
+        "original_name": original_name,
+        "stored_name": stored_name,
+        "media_kind": kind,
+        "total_bytes": total_bytes,
+        "sha256_hex": expected_sha,
+        "received_bytes": 0,
+        "ready": False,
+        "created_at": now,
+        "expires_at": now + UPLOAD_TTL_SECONDS,
+    }
+    async with _upload_lock:
+        _remove_expired_uploads_unlocked()
+        directory = _upload_dir(upload_id)
+        directory.mkdir(parents=False, exist_ok=False)
+        (directory / stored_name).touch(exist_ok=False)
+        _write_upload_manifest(upload_id, manifest)
+    return {
+        "upload_ref": _make_upload_ref(upload_id, token),
+        "chunk_size_bytes": UPLOAD_CHUNK_BYTES,
+        "received_bytes": 0,
+        "total_bytes": total_bytes,
+        "rh_charge": False,
+    }
+
+
+@mcp.tool()
+async def upload_chatgpt_attachment_chunk(
+    upload_ref: str,
+    offset_bytes: int,
+    chunk_base64: str,
+) -> dict[str, Any]:
+    """Append one base64 chunk to a Railway attachment upload. Does not consume RH."""
+    upload_id, token = _parse_upload_ref(upload_ref)
+    try:
+        chunk = base64.b64decode(chunk_base64, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise ValueError("chunk_base64 is not valid base64") from exc
+    if not chunk:
+        raise ValueError("chunk_base64 decodes to an empty chunk")
+    if len(chunk) > UPLOAD_CHUNK_BYTES:
+        raise ValueError(f"Decoded chunk exceeds UPLOAD_CHUNK_BYTES ({UPLOAD_CHUNK_BYTES})")
+    async with _upload_lock:
+        manifest = _read_upload_manifest(upload_id)
+        _verify_upload_token(manifest, token)
+        if manifest.get("ready"):
+            raise ValueError("Upload is already complete")
+        if float(manifest.get("expires_at") or 0) < time.time():
+            raise ValueError("Upload reference has expired")
+        current = int(manifest.get("received_bytes") or 0)
+        if offset_bytes != current:
+            raise ValueError(f"Expected offset_bytes={current}, received {offset_bytes}")
+        total = int(manifest["total_bytes"])
+        if current + len(chunk) > total:
+            raise ValueError("Chunk would exceed declared total_bytes")
+        payload_path = _upload_payload_path(upload_id, manifest)
+        if payload_path.stat().st_size != current:
+            raise ValueError("Upload file size does not match manifest offset")
+        with payload_path.open("ab") as handle:
+            handle.write(chunk)
+        current += len(chunk)
+        manifest["received_bytes"] = current
+        manifest["expires_at"] = time.time() + UPLOAD_TTL_SECONDS
+        _write_upload_manifest(upload_id, manifest)
+    return {
+        "upload_ref": upload_ref,
+        "received_bytes": current,
+        "total_bytes": total,
+        "remaining_bytes": total - current,
+        "rh_charge": False,
+    }
+
+
+@mcp.tool()
+async def complete_chatgpt_attachment_upload(upload_ref: str) -> dict[str, Any]:
+    """Verify size and SHA-256, then mark one Railway attachment upload ready. Does not consume RH."""
+    upload_id, token = _parse_upload_ref(upload_ref)
+    async with _upload_lock:
+        manifest = _read_upload_manifest(upload_id)
+        _verify_upload_token(manifest, token)
+        payload_path = _upload_payload_path(upload_id, manifest)
+        total = int(manifest["total_bytes"])
+        received = int(manifest.get("received_bytes") or 0)
+        if received != total or payload_path.stat().st_size != total:
+            raise ValueError(f"Upload is incomplete: received {received} of {total} bytes")
+        actual_sha = _sha256_file(payload_path)
+        if actual_sha != manifest["sha256_hex"]:
+            raise ValueError("SHA-256 mismatch; restart the upload")
+        manifest["ready"] = True
+        manifest["completed_at"] = time.time()
+        manifest["expires_at"] = time.time() + UPLOAD_TTL_SECONDS
+        _write_upload_manifest(upload_id, manifest)
+    return {
+        "upload_ref": upload_ref,
+        "ready": True,
+        "file_name": manifest["original_name"],
+        "media_kind": manifest["media_kind"],
+        "total_bytes": total,
+        "sha256_hex": actual_sha,
+        "expires_at": manifest["expires_at"],
+        "rh_charge": False,
     }
 
 
@@ -516,9 +771,10 @@ async def submit_scail_vace_replacement_from_chatgpt_attachments(
 ) -> dict[str, Any]:
     """Start SCAIL person replacement followed automatically by Wan2.2 VACE background replacement.
 
-    The two file parameters accept a ChatGPT attachment passed as a readable server-local path or HTTP(S)
-    temporary download URL. This operation consumes one SCAIL RH task and one VACE RH task, so
-    confirm_rh_charge must be true.
+    For remote Railway deployments, upload each ChatGPT attachment with begin/upload/complete and pass
+    the resulting scail-upload:// references here. Public HTTP(S) URLs and readable server-local paths are
+    also accepted. This operation consumes one SCAIL RH task and one VACE RH task, so confirm_rh_charge
+    must be true.
     """
     if not confirm_rh_charge:
         raise ValueError("Set confirm_rh_charge=true only after the user explicitly confirms two RH tasks")
@@ -646,7 +902,12 @@ async def list_scail_vace_replacements(limit: int = 20) -> list[dict[str, Any]]:
 
 @mcp.custom_route("/health", methods=["GET"])
 async def health(_: Request) -> Response:
-    return JSONResponse({"status": "ok", "service": "scail-vace-mcp"})
+    return JSONResponse({
+        "status": "ok",
+        "service": "scail-vace-mcp",
+        "version": SERVICE_VERSION,
+        "attachment_upload": "chunked_base64",
+    })
 
 
 @mcp.custom_route("/files/{pipeline_id}.mp4", methods=["GET"])
