@@ -1,1165 +1,667 @@
-"""RunningHub two-stage person + background replacement MCP server.
-
-Stage 1: SCAIL-2 replaces the person while keeping motion/camera structure.
-Stage 2: Bernini-R replaces the environment from a background reference image.
-
-The server discovers each public AI App's configurable nodeInfoList at runtime,
-so it does not depend on brittle hard-coded node IDs. Optional environment
-variables can override automatic node selection when an app author changes the
-published workflow.
-"""
-
 from __future__ import annotations
 
 import asyncio
-import ipaddress
 import json
 import mimetypes
 import os
 import re
+import secrets
 import shutil
-import socket
 import subprocess
 import time
 import uuid
-from fractions import Fraction
 from pathlib import Path
-from typing import Annotated, Any
-from urllib.parse import unquote, urljoin, urlparse
+from typing import Any
+from urllib.parse import urlparse
 
 import httpx
-from fastmcp import FastMCP
-from pydantic import BaseModel, ConfigDict, Field
+from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 from starlette.requests import Request
-from starlette.responses import FileResponse, JSONResponse
+from starlette.responses import FileResponse, JSONResponse, Response
 
 
-RUNNINGHUB_BASE_URL = os.getenv("RUNNINGHUB_BASE_URL", "https://www.runninghub.cn").rstrip("/")
-RUNNINGHUB_API_KEY = os.getenv("RUNNINGHUB_API_KEY", "").strip()
-SCAIL_WEBAPP_ID = os.getenv("SCAIL_WEBAPP_ID", "2067490689415471105").strip()
-BERNINI_WEBAPP_ID = os.getenv("BERNINI_WEBAPP_ID", "2062558412986216449").strip()
-DATA_DIR = Path(os.getenv("DATA_DIR", "/data")).expanduser()
+RH_BASE_URL = os.getenv("RUNNINGHUB_BASE_URL", "https://www.runninghub.cn").rstrip("/")
+RH_API_KEY = os.getenv("RUNNINGHUB_API_KEY", "").strip()
+SCAIL_WEBAPP_ID = os.getenv("SCAIL_WEBAPP_ID", "2064610888811900929").strip()
+VACE_WEBAPP_ID = os.getenv("VACE_WEBAPP_ID", "2035730491302744066").strip()
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
-MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "300"))
-MAX_DOWNLOAD_MB = int(os.getenv("MAX_DOWNLOAD_MB", "2048"))
-NODE_CACHE_TTL_SECONDS = int(os.getenv("NODE_CACHE_TTL_SECONDS", "3600"))
-ALLOW_CONCURRENT_PIPELINES = os.getenv("ALLOW_CONCURRENT_PIPELINES", "false").lower() == "true"
-KEEP_INTERMEDIATE_FILES = os.getenv("KEEP_INTERMEDIATE_FILES", "false").lower() == "true"
-BERNINI_FRAME_MULTIPLE = max(1, int(os.getenv("BERNINI_FRAME_MULTIPLE", "4")))
-BERNINI_FRAME_OFFSET = int(os.getenv("BERNINI_FRAME_OFFSET", "1"))
-BERNINI_MAX_FRAMES = max(1, int(os.getenv("BERNINI_MAX_FRAMES", "4097")))
+RAILWAY_PUBLIC_DOMAIN = os.getenv("RAILWAY_PUBLIC_DOMAIN", "").strip()
+DATA_DIR = Path(os.getenv("DATA_DIR", "/data")).resolve()
+JOBS_DIR = DATA_DIR / "jobs"
+STATE_FILE = DATA_DIR / "pipelines.json"
+MAX_INPUT_BYTES = int(os.getenv("MAX_INPUT_BYTES", str(500 * 1024 * 1024)))
+HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT_SECONDS", "120"))
 
-IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp"}
-VIDEO_SUFFIXES = {".mp4", ".mov", ".mkv", ".avi", ".webm"}
-CONTENT_TYPE_SUFFIXES = {
-    "image/jpeg": ".jpg",
-    "image/png": ".png",
-    "image/webp": ".webp",
-    "video/mp4": ".mp4",
-    "video/quicktime": ".mov",
-    "video/x-matroska": ".mkv",
-    "video/x-msvideo": ".avi",
-    "video/webm": ".webm",
-}
-
-
-class OpenAIFile(BaseModel):
-    """ChatGPT attachment passed through the OpenAI MCP file contract."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    download_url: str = Field(
-        description="Temporary HTTPS URL that the Railway MCP server can download"
-    )
-    file_id: str = Field(description="ChatGPT attachment file identifier")
-    # ChatGPT may omit these fields. Keeping a string schema with a None default
-    # is intentional: the schema finalizer below removes the default without
-    # turning the fields into nullable unions.
-    mime_type: str = Field(default=None, description="Attachment MIME type")  # type: ignore[assignment]
-    file_name: str = Field(default=None, description="Original attachment name")  # type: ignore[assignment]
-
-if not DATA_DIR.parent.exists():
-    DATA_DIR = Path("./data")
 DATA_DIR.mkdir(parents=True, exist_ok=True)
-PIPELINES_DIR = DATA_DIR / "pipelines"
-PIPELINES_DIR.mkdir(parents=True, exist_ok=True)
+JOBS_DIR.mkdir(parents=True, exist_ok=True)
 
-DEFAULT_STAGE1_PROMPT = (
-    "Replace only the target person in the source video with the person from the reference image. "
-    "Preserve the source video's complete motion, pose, timing, camera movement, framing, props and "
-    "background. Preserve the reference person's identity, face, hair, body proportions, complete outfit "
-    "and footwear. Natural temporal consistency, no flicker, no extra limbs, no text, no logo, no watermark."
-)
-
-DEFAULT_STAGE2_PROMPT = (
-    "Replace only the entire environment and background with the scene from the background reference image. "
-    "Keep the foreground person's identity, face, hair, body, clothing, footwear, hand-held objects, pose, "
-    "motion, timing and camera framing unchanged. Use only the environment from the background reference; "
-    "ignore and remove any person, text, logo or watermark contained in that reference. Match perspective, "
-    "shadows, lighting and color naturally. No duplicate person and no background remnants."
-)
+_public_host = urlparse(PUBLIC_BASE_URL).netloc or RAILWAY_PUBLIC_DOMAIN
+_allowed_hosts = ["localhost:*", "127.0.0.1:*"]
+if _public_host:
+    _allowed_hosts.extend([_public_host, f"{_public_host}:*"])
+_allowed_origins = [
+    value.strip()
+    for value in os.getenv(
+        "MCP_ALLOWED_ORIGINS",
+        "https://chatgpt.com,https://chat.openai.com",
+    ).split(",")
+    if value.strip()
+]
+if PUBLIC_BASE_URL:
+    _allowed_origins.append(PUBLIC_BASE_URL)
 
 mcp = FastMCP(
-    name="RunningHub Person + Background Replacement",
+    "SCAIL-2 + Wan2.2 VACE Person and Background Replacement",
     instructions=(
-        "Two-stage RunningHub video editor. First use SCAIL-2 to replace the person, then Bernini-R "
-        "to replace the background. Submitting a pipeline consumes RunningHub RH. Always require the "
-        "user's explicit confirm_rh_charge=true before submission."
+        "Two-stage RunningHub video editor. Stage 1 replaces the person with SCAIL-2; "
+        "stage 2 replaces the background with Wan2.2 VACE. Costly tools require explicit RH confirmation."
+    ),
+    transport_security=TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=list(dict.fromkeys(_allowed_hosts)),
+        allowed_origins=list(dict.fromkeys(_allowed_origins)),
     ),
 )
 
-
-def finalize_openai_file_param_schema(
-    tool_name: str, *parameter_names: str
-) -> None:
-    """Expose file parameters in the exact schema expected by ChatGPT apps."""
-
-    # FastMCP 2.14.x exposes get_tool() as an async API. This schema adjustment
-    # runs during module import, before an event loop exists, so read the tool
-    # from the manager's local registry instead of creating an un-awaited
-    # coroutine. requirements.txt pins the compatible FastMCP version.
-    tool = mcp._tool_manager._tools.get(tool_name)  # noqa: SLF001
-    if tool is None:
-        raise RuntimeError(f"Missing registered tool: {tool_name}")
-    properties = tool.parameters.get("properties", {})
-    definitions = tool.parameters.get("$defs", {})
-    for parameter_name in parameter_names:
-        file_schema = properties.get(parameter_name)
-        if not isinstance(file_schema, dict):
-            raise RuntimeError(f"Missing file parameter schema: {parameter_name}")
-
-        reference = file_schema.get("$ref")
-        if isinstance(reference, str) and reference.startswith("#/$defs/"):
-            definition_name = reference.rsplit("/", 1)[-1]
-            definition = definitions.get(definition_name)
-            if not isinstance(definition, dict):
-                raise RuntimeError(
-                    f"Missing file parameter definition: {definition_name}"
-                )
-            file_schema.clear()
-            file_schema.update(definition)
-
-        file_schema["additionalProperties"] = False
-        file_properties = file_schema.get("properties", {})
-        for optional_name in ("mime_type", "file_name"):
-            optional_schema = file_properties.get(optional_name)
-            if isinstance(optional_schema, dict):
-                optional_schema.pop("default", None)
-
-_node_cache: dict[str, tuple[float, list[dict[str, Any]]]] = {}
 _state_lock = asyncio.Lock()
+_node_cache: dict[str, tuple[float, list[dict[str, Any]]]] = {}
 
 
-def _require_api_key() -> None:
-    if not RUNNINGHUB_API_KEY:
-        raise ValueError("RUNNINGHUB_API_KEY is not configured on Railway")
+def _require_config() -> None:
+    missing = []
+    if not RH_API_KEY:
+        missing.append("RUNNINGHUB_API_KEY")
+    if not SCAIL_WEBAPP_ID:
+        missing.append("SCAIL_WEBAPP_ID")
+    if not VACE_WEBAPP_ID:
+        missing.append("VACE_WEBAPP_ID")
+    if missing:
+        raise RuntimeError("Missing environment variables: " + ", ".join(missing))
 
 
-def _headers() -> dict[str, str]:
-    return {
-        "Authorization": f"Bearer {RUNNINGHUB_API_KEY}",
-        "Accept": "application/json",
-        "User-Agent": "runninghub-person-background-mcp/1.0",
-    }
+def _read_state_unlocked() -> dict[str, dict[str, Any]]:
+    if not STATE_FILE.exists():
+        return {}
+    try:
+        return json.loads(STATE_FILE.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {}
 
 
-def _client() -> httpx.AsyncClient:
-    timeout = httpx.Timeout(connect=30.0, read=300.0, write=300.0, pool=30.0)
-    return httpx.AsyncClient(timeout=timeout, follow_redirects=True, headers=_headers())
+def _write_state_unlocked(state: dict[str, dict[str, Any]]) -> None:
+    tmp = STATE_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(tmp, STATE_FILE)
 
 
-def _public_client(*, follow_redirects: bool = False) -> httpx.AsyncClient:
-    """HTTP client for untrusted media URLs; never forwards the RunningHub key."""
-    timeout = httpx.Timeout(connect=30.0, read=300.0, write=300.0, pool=30.0)
-    return httpx.AsyncClient(
-        timeout=timeout,
-        follow_redirects=follow_redirects,
-        headers={"Accept": "*/*", "User-Agent": "runninghub-person-background-mcp/1.1"},
-    )
+async def _get_pipeline(pipeline_id: str) -> dict[str, Any]:
+    async with _state_lock:
+        item = _read_state_unlocked().get(pipeline_id)
+        if not item:
+            raise ValueError(f"Unknown pipeline_id: {pipeline_id}")
+        return dict(item)
 
 
-def _unwrap_response(payload: dict[str, Any]) -> dict[str, Any]:
-    if "code" in payload and payload.get("code") not in (0, "0", None):
-        message = payload.get("msg") or payload.get("message") or "RunningHub request failed"
-        raise RuntimeError(f"RunningHub error {payload.get('code')}: {message}")
-    data = payload.get("data")
-    return data if isinstance(data, dict) else payload
+async def _save_pipeline(item: dict[str, Any]) -> None:
+    item["updated_at"] = time.time()
+    async with _state_lock:
+        state = _read_state_unlocked()
+        state[item["pipeline_id"]] = item
+        _write_state_unlocked(state)
 
 
-async def _get_nodes(webapp_id: str, force_refresh: bool = False) -> list[dict[str, Any]]:
-    _require_api_key()
+def _safe_pipeline_id(value: str) -> str:
+    if not re.fullmatch(r"[0-9a-fA-F-]{36}", value):
+        raise ValueError("Invalid pipeline_id")
+    return value
+
+
+def _json_response_or_raise(response: httpx.Response) -> dict[str, Any]:
+    response.raise_for_status()
+    try:
+        data = response.json()
+    except ValueError as exc:
+        raise RuntimeError(f"RunningHub returned non-JSON HTTP {response.status_code}") from exc
+    if not isinstance(data, dict):
+        raise RuntimeError("RunningHub returned an unexpected response")
+    return data
+
+
+def _auth_headers() -> dict[str, str]:
+    return {"Authorization": f"Bearer {RH_API_KEY}"}
+
+
+async def _api_call_demo(webapp_id: str, force_refresh: bool = False) -> list[dict[str, Any]]:
+    _require_config()
     cached = _node_cache.get(webapp_id)
-    if cached and not force_refresh and time.time() - cached[0] < NODE_CACHE_TTL_SECONDS:
+    if cached and not force_refresh and time.time() - cached[0] < 300:
         return cached[1]
-
-    endpoint = f"{RUNNINGHUB_BASE_URL}/api/webapp/apiCallDemo"
-    async with _client() as client:
-        response = await client.get(endpoint, params={"webappId": webapp_id})
-        response.raise_for_status()
-        payload = response.json()
-        try:
-            data = _unwrap_response(payload)
-        except RuntimeError:
-            # Some RunningHub deployments still require apiKey in the query as
-            # well as the Bearer header. Retry only after the safer form fails.
-            response = await client.get(
-                endpoint,
-                params={"webappId": webapp_id, "apiKey": RUNNINGHUB_API_KEY},
-            )
-            response.raise_for_status()
-            data = _unwrap_response(response.json())
-
-    nodes = data.get("nodeInfoList")
-    if not isinstance(nodes, list) or not nodes:
-        raise RuntimeError(f"No configurable nodeInfoList returned for AI App {webapp_id}")
-    normalized = [dict(node) for node in nodes if isinstance(node, dict)]
-    _node_cache[webapp_id] = (time.time(), normalized)
-    return normalized
+    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT, follow_redirects=True) as client:
+        response = await client.get(
+            f"{RH_BASE_URL}/api/webapp/apiCallDemo",
+            params={"apiKey": RH_API_KEY, "webappId": webapp_id},
+            headers=_auth_headers(),
+        )
+    payload = _json_response_or_raise(response)
+    if payload.get("code") != 0:
+        raise RuntimeError(f"Cannot inspect RunningHub app {webapp_id}: {payload}")
+    nodes = (payload.get("data") or {}).get("nodeInfoList") or []
+    if not isinstance(nodes, list):
+        raise RuntimeError(f"RunningHub app {webapp_id} returned no nodeInfoList")
+    _node_cache[webapp_id] = (time.time(), nodes)
+    return nodes
 
 
 def _node_text(node: dict[str, Any]) -> str:
     return " ".join(
-        str(node.get(key, ""))
-        for key in ("nodeName", "fieldName", "fieldType", "description", "descriptionEn")
+        str(node.get(k, ""))
+        for k in ("nodeId", "nodeName", "fieldName", "fieldType", "description", "descriptionEn")
     ).lower()
 
 
-def _is_type(node: dict[str, Any], kind: str) -> bool:
-    text = _node_text(node)
-    field_type = str(node.get("fieldType", "")).upper()
-    field_name = str(node.get("fieldName", "")).lower()
-    node_name = str(node.get("nodeName", "")).lower()
-    if kind == "image":
-        return "IMAGE" in field_type or field_name in {"image", "images"} or "loadimage" in node_name
-    if kind == "video":
-        return "VIDEO" in field_type or "video" in field_name or "loadvideo" in node_name
-    if kind == "prompt":
-        return (
-            field_name in {"prompt", "text", "positive", "positive_prompt"}
-            or "STRING" in field_type
-            or "prompt" in text
-        )
-    if kind == "integer":
-        return field_type in {"INT", "INTEGER", "NUMBER"} or field_name in {
-            "value", "frames", "frame_count", "num_frames"
-        }
-    return False
-
-
-def _env_override(prefix: str) -> tuple[str, str] | None:
+def _env_node(prefix: str, field_name: str, field_value: Any) -> dict[str, Any] | None:
     node_id = os.getenv(f"{prefix}_NODE_ID", "").strip()
-    field_name = os.getenv(f"{prefix}_FIELD_NAME", "").strip()
-    if node_id and field_name:
-        return node_id, field_name
-    if node_id or field_name:
-        raise ValueError(f"Set both {prefix}_NODE_ID and {prefix}_FIELD_NAME")
-    return None
+    configured_field = os.getenv(f"{prefix}_FIELD_NAME", field_name).strip()
+    if not node_id:
+        return None
+    return {"nodeId": node_id, "fieldName": configured_field, "fieldValue": field_value}
 
 
-def _score_node(node: dict[str, Any], positive: list[str], negative: list[str]) -> int:
-    text = _node_text(node)
-    score = sum(3 for token in positive if token.lower() in text)
-    score -= sum(4 for token in negative if token.lower() in text)
-    if str(node.get("fieldName", "")).lower() == "prompt":
-        score += 2
-    return score
-
-
-def _resolve_node(
+def _find_node(
     nodes: list[dict[str, Any]],
-    *,
-    kind: str,
-    env_prefix: str,
-    positive: list[str],
-    negative: list[str] | None = None,
-    required: bool = True,
-) -> dict[str, Any] | None:
-    override = _env_override(env_prefix)
-    if override:
-        node_id, field_name = override
-        for node in nodes:
-            if str(node.get("nodeId")) == node_id and str(node.get("fieldName")) == field_name:
-                return node
-        raise ValueError(
-            f"Configured {env_prefix}={node_id}/{field_name} is absent from the current nodeInfoList"
-        )
+    field_types: set[str],
+    include_groups: list[list[str]],
+    exclude: tuple[str, ...] = (),
+    fallback_unique: bool = True,
+) -> dict[str, Any]:
+    typed = [n for n in nodes if str(n.get("fieldType", "")).upper() in field_types]
+    for words in include_groups:
+        matches = []
+        for node in typed:
+            text = _node_text(node)
+            if all(word.lower() in text for word in words) and not any(x.lower() in text for x in exclude):
+                matches.append(node)
+        if len(matches) == 1:
+            return matches[0]
+    filtered = [n for n in typed if not any(x.lower() in _node_text(n) for x in exclude)]
+    if fallback_unique and len(filtered) == 1:
+        return filtered[0]
+    candidates = [
+        {k: n.get(k) for k in ("nodeId", "nodeName", "fieldName", "fieldType", "description")}
+        for n in filtered
+    ]
+    raise RuntimeError(f"Cannot uniquely map node. Candidates: {candidates}")
 
-    candidates = [node for node in nodes if _is_type(node, kind)]
-    if not candidates:
-        if required:
-            raise ValueError(f"No {kind} input found; configure {env_prefix}_NODE_ID/FIELD_NAME")
-        return None
-    ranked = sorted(
-        ((_score_node(node, positive, negative or []), node) for node in candidates),
-        key=lambda item: item[0],
-        reverse=True,
+
+def _resolve_scail(nodes: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    person = _find_node(
+        nodes,
+        {"IMAGE"},
+        [["参考", "图"], ["person"], ["人物"]],
+        exclude=("背景", "background"),
     )
-    if len(ranked) == 1 or ranked[0][0] > ranked[1][0]:
-        return ranked[0][1]
-    if ranked[0][0] > 0:
-        tied = [node for score, node in ranked if score == ranked[0][0]]
-        if len(tied) == 1:
-            return tied[0]
-    options = [f"{n.get('nodeId')}/{n.get('fieldName')} ({n.get('description', '')})" for _, n in ranked]
-    if required:
-        raise ValueError(
-            f"Ambiguous {kind} input for {env_prefix}. Set node override after inspect: {options}"
+    video = _find_node(nodes, {"VIDEO"}, [["宣传视频"], ["驱动", "视频"], ["video"]])
+    prompt = _find_node(nodes, {"STRING"}, [["提示词"], ["prompt"], ["text"]])
+    return {"person_image": person, "source_video": video, "prompt": prompt}
+
+
+def _resolve_vace(nodes: list[dict[str, Any]]) -> dict[str, dict[str, Any] | None]:
+    video = _find_node(
+        nodes,
+        {"VIDEO"},
+        [["原始视频"], ["原视频"], ["上传原始视频"], ["input", "video"], ["loadvideo"]],
+        exclude=("音频", "audio"),
+    )
+    background = _find_node(
+        nodes,
+        {"IMAGE"},
+        [["背景", "参考"], ["目标背景"], ["背景图"], ["background"], ["loadimage"]],
+    )
+    prompt = _find_node(
+        nodes,
+        {"STRING"},
+        [["场景描述"], ["背景", "描述"], ["提示词"], ["prompt"], ["text"]],
+    )
+    frame = None
+    try:
+        frame = _find_node(
+            nodes,
+            {"INT", "INTEGER"},
+            [["总帧"], ["帧数"], ["frame", "count"], ["length"]],
+            fallback_unique=False,
         )
-    return None
+    except RuntimeError:
+        pass
+    return {"source_video": video, "background_image": background, "prompt": prompt, "frame_count": frame}
 
 
-def _resolve_stage1(nodes: list[dict[str, Any]]) -> dict[str, dict[str, Any] | None]:
-    return {
-        "person_image": _resolve_node(
-            nodes,
-            kind="image",
-            env_prefix="SCAIL_REFERENCE_IMAGE",
-            positive=["参考", "人物", "角色", "主图", "reference", "character", "subject"],
-            negative=["背景", "background"],
-        ),
-        "source_video": _resolve_node(
-            nodes,
-            kind="video",
-            env_prefix="SCAIL_SOURCE_VIDEO",
-            positive=["驱动", "原视频", "参考视频", "source", "driving", "motion", "video"],
-            negative=["背景", "background"],
-        ),
-        "prompt": _resolve_node(
-            nodes,
-            kind="prompt",
-            env_prefix="SCAIL_PROMPT",
-            positive=["提示", "prompt", "描述", "text"],
-            required=False,
-        ),
-    }
-
-
-def _resolve_stage2(nodes: list[dict[str, Any]]) -> dict[str, dict[str, Any] | None]:
-    return {
-        "source_video": _resolve_node(
-            nodes,
-            kind="video",
-            env_prefix="BERNINI_SOURCE_VIDEO",
-            positive=["原视频", "参考视频", "source", "input", "video"],
-            negative=["背景视频", "background video"],
-        ),
-        "background_image": _resolve_node(
-            nodes,
-            kind="image",
-            env_prefix="BERNINI_BACKGROUND_IMAGE",
-            positive=["背景", "环境", "场景", "background", "environment", "scene"],
-            negative=["人物", "character", "person"],
-        ),
-        "prompt": _resolve_node(
-            nodes,
-            kind="prompt",
-            env_prefix="BERNINI_PROMPT",
-            positive=["提示", "prompt", "替换要求", "描述", "text"],
-            required=False,
-        ),
-        "frame_count": _resolve_node(
-            nodes,
-            kind="integer",
-            env_prefix="BERNINI_FRAME_COUNT",
-            positive=["视频总帧数", "总帧数", "frame count", "num frames", "frames"],
-            negative=["人数", "person", "seed", "width", "height"],
-            required=False,
-        ),
-    }
-
-
-def _public_node(node: dict[str, Any] | None) -> dict[str, Any] | None:
-    if node is None:
-        return None
-    return {
-        "nodeId": str(node.get("nodeId", "")),
-        "nodeName": node.get("nodeName"),
-        "fieldName": node.get("fieldName"),
-        "fieldType": node.get("fieldType"),
-        "description": node.get("description") or node.get("descriptionEn"),
-        "fieldValue": node.get("fieldValue"),
-    }
-
-
-def _override(node: dict[str, Any], value: Any) -> dict[str, Any]:
-    return {
+def _override(node: dict[str, Any], prefix: str, value: Any) -> dict[str, Any]:
+    return _env_node(prefix, str(node.get("fieldName", "value")), value) or {
         "nodeId": str(node["nodeId"]),
         "fieldName": str(node["fieldName"]),
         "fieldValue": value,
     }
 
 
-def _validate_local_file(path_text: str, allowed_suffixes: set[str]) -> Path:
-    path = Path(path_text).expanduser().resolve()
-    if not path.is_file():
-        raise ValueError(f"Attachment/local file does not exist: {path}")
-    if path.suffix.lower() not in allowed_suffixes:
-        raise ValueError(f"Unsupported file type {path.suffix}; allowed: {sorted(allowed_suffixes)}")
-    if path.stat().st_size > MAX_UPLOAD_MB * 1024 * 1024:
-        raise ValueError(f"File exceeds MAX_UPLOAD_MB={MAX_UPLOAD_MB}: {path.name}")
-    return path
-
-
-async def _validate_public_https_url(url: str) -> None:
-    parsed = urlparse(url)
-    if parsed.scheme.lower() != "https" or not parsed.hostname:
-        raise ValueError("Remote media input must be an HTTPS URL")
-    if parsed.username or parsed.password:
-        raise ValueError("Remote media URL must not contain embedded credentials")
-    try:
-        addresses = await asyncio.get_running_loop().getaddrinfo(
-            parsed.hostname,
-            parsed.port or 443,
-            type=socket.SOCK_STREAM,
-        )
-    except socket.gaierror as exc:
-        raise ValueError(f"Unable to resolve remote media host: {parsed.hostname}") from exc
-    if not addresses:
-        raise ValueError(f"Unable to resolve remote media host: {parsed.hostname}")
-    for address in addresses:
-        ip = ipaddress.ip_address(address[4][0])
-        if not ip.is_global:
-            raise ValueError(f"Remote media host resolves to a non-public address: {ip}")
-
-
-def _remote_suffix(response: httpx.Response, url: str, allowed_suffixes: set[str]) -> str:
-    disposition = response.headers.get("content-disposition", "")
-    match = re.search(r"filename\*=UTF-8''([^;]+)|filename=\"?([^\";]+)", disposition, re.I)
-    names = []
-    if match:
-        names.append(unquote(match.group(1) or match.group(2) or ""))
-    names.append(unquote(Path(urlparse(url).path).name))
-    for name in names:
-        suffix = Path(name).suffix.lower()
-        if suffix in allowed_suffixes:
-            return suffix
-    content_type = response.headers.get("content-type", "").split(";", 1)[0].strip().lower()
-    suffix = CONTENT_TYPE_SUFFIXES.get(content_type, "")
-    if suffix in allowed_suffixes:
-        return suffix
-    if content_type.startswith("text/") or content_type in {"application/json", "application/xml"}:
-        raise ValueError(f"Remote URL returned {content_type}, not a supported media file")
-    return ".jpg" if allowed_suffixes == IMAGE_SUFFIXES else ".mp4"
-
-
-async def _download_external_input(
-    url: str,
-    destination_stem: Path,
-    allowed_suffixes: set[str],
-) -> Path:
-    current_url = url.strip()
-    async with _public_client() as client:
-        for _ in range(6):
-            await _validate_public_https_url(current_url)
-            request = client.build_request("GET", current_url)
-            response = await client.send(request, stream=True)
-            if response.is_redirect:
-                location = response.headers.get("location")
-                await response.aclose()
-                if not location:
-                    raise ValueError("Remote media redirect did not include a location")
-                current_url = urljoin(current_url, location)
-                continue
-            try:
-                response.raise_for_status()
-                declared_size = int(response.headers.get("content-length") or 0)
-                maximum = MAX_UPLOAD_MB * 1024 * 1024
-                if declared_size > maximum:
-                    raise ValueError(f"Remote file exceeds MAX_UPLOAD_MB={MAX_UPLOAD_MB}")
-                suffix = _remote_suffix(response, current_url, allowed_suffixes)
-                destination = destination_stem.with_suffix(suffix)
-                temporary = destination.with_suffix(destination.suffix + ".part")
-                total = 0
-                try:
-                    with temporary.open("wb") as handle:
-                        async for chunk in response.aiter_bytes(1024 * 1024):
-                            total += len(chunk)
-                            if total > maximum:
-                                raise ValueError(f"Remote file exceeds MAX_UPLOAD_MB={MAX_UPLOAD_MB}")
-                            handle.write(chunk)
-                    if total == 0:
-                        raise ValueError("Remote media file is empty")
-                    temporary.replace(destination)
-                except Exception:
-                    temporary.unlink(missing_ok=True)
-                    raise
-                return destination
-            finally:
-                await response.aclose()
-    raise ValueError("Remote media URL exceeded the redirect limit")
-
-
-async def _ingest_input(
-    value: OpenAIFile | str,
-    destination_stem: Path,
-    allowed_suffixes: set[str],
-) -> Path:
-    if isinstance(value, OpenAIFile):
-        declared_type = (value.mime_type or "").strip().lower()
-        expected_prefix = "image/" if allowed_suffixes == IMAGE_SUFFIXES else "video/"
-        if declared_type and not declared_type.startswith(expected_prefix):
-            raise ValueError(
-                f"Attachment {value.file_name or value.file_id} has MIME type "
-                f"{value.mime_type}; expected {expected_prefix.rstrip('/')}"
-            )
-        return await _download_external_input(
-            value.download_url,
-            destination_stem,
-            allowed_suffixes,
-        )
-
-    value = value.strip()
-    if value.lower().startswith(("https://", "http://")):
-        return await _download_external_input(value, destination_stem, allowed_suffixes)
-    source = _validate_local_file(value, allowed_suffixes)
-    destination = destination_stem.with_suffix(source.suffix.lower())
-    if source != destination:
-        await asyncio.to_thread(shutil.copy2, source, destination)
-    return destination
-
-
-async def _upload_file(path: Path) -> dict[str, Any]:
-    endpoint = f"{RUNNINGHUB_BASE_URL}/openapi/v2/media/upload/binary"
-    mime = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
-    async with _client() as client:
-        with path.open("rb") as handle:
-            response = await client.post(endpoint, files={"file": (path.name, handle, mime)})
-        response.raise_for_status()
-        data = _unwrap_response(response.json())
-    file_name = data.get("fileName") or data.get("file_name")
-    if not file_name:
-        raise RuntimeError(f"RunningHub upload returned no fileName for {path.name}")
-    return {
-        "fileName": file_name,
-        "download_url": data.get("download_url") or data.get("downloadUrl"),
-        "type": data.get("type") or data.get("fileType"),
-        "size": data.get("size"),
-    }
-
-
-async def _submit_app(webapp_id: str, overrides: list[dict[str, Any]]) -> dict[str, Any]:
-    endpoint = f"{RUNNINGHUB_BASE_URL}/task/openapi/ai-app/run"
-    body = {
-        "webappId": webapp_id,
-        "apiKey": RUNNINGHUB_API_KEY,
-        "nodeInfoList": overrides,
-    }
-    async with _client() as client:
-        response = await client.post(endpoint, json=body)
-        response.raise_for_status()
-        data = _unwrap_response(response.json())
-    task_id = str(data.get("taskId") or "")
-    if not task_id:
-        raise RuntimeError(f"RunningHub accepted no taskId for AI App {webapp_id}")
-    node_errors: dict[str, Any] = {}
-    prompt_tips = data.get("promptTips")
-    if isinstance(prompt_tips, str):
-        try:
-            node_errors = json.loads(prompt_tips).get("node_errors") or {}
-        except (json.JSONDecodeError, AttributeError):
-            pass
-    if node_errors:
-        raise RuntimeError(f"RunningHub workflow node validation failed: {node_errors}")
-    return {"task_id": task_id, "task_status": data.get("taskStatus"), "raw": data}
-
-
-async def _query_task(task_id: str) -> dict[str, Any]:
-    endpoint = f"{RUNNINGHUB_BASE_URL}/openapi/v2/query"
-    async with _client() as client:
-        response = await client.post(endpoint, json={"taskId": task_id})
-        response.raise_for_status()
-        payload = response.json()
-    if "code" in payload and payload.get("code") in (804, 813):
-        return {"status": "RUNNING" if payload.get("code") == 804 else "QUEUED", "results": []}
-    if "code" in payload and payload.get("code") == 805:
-        return {"status": "FAILED", "error": payload.get("msg") or payload.get("data")}
-    data = _unwrap_response(payload)
-    status = str(data.get("status") or data.get("taskStatus") or "UNKNOWN").upper()
-    return {
-        "status": status,
-        "results": data.get("results") or data.get("data") or [],
-        "error": data.get("errorMessage") or data.get("failedReason") or data.get("errorCode"),
-        "raw": data,
-    }
-
-
-def _video_results(results: Any) -> list[dict[str, Any]]:
-    if isinstance(results, dict):
-        results = [results]
-    if not isinstance(results, list):
-        return []
-    videos = []
-    for item in results:
-        if isinstance(item, str):
-            item = {"url": item}
-        if not isinstance(item, dict):
-            continue
-        url = str(item.get("url") or item.get("fileUrl") or item.get("download_url") or "")
-        output_type = str(item.get("outputType") or item.get("type") or "").lower()
-        if url and (output_type in {"mp4", "mov", "video"} or url.lower().split("?")[0].endswith((".mp4", ".mov", ".webm"))):
-            videos.append(dict(item, url=url))
-    return videos
-
-
-async def _download(url: str, destination: Path) -> Path:
+async def _materialize_input(value: str, destination: Path) -> Path:
     destination.parent.mkdir(parents=True, exist_ok=True)
-    temporary = destination.with_suffix(destination.suffix + ".part")
+    if value.startswith("file://"):
+        value = value[7:]
+    source = Path(value)
+    if source.is_file():
+        if source.resolve() != destination.resolve():
+            shutil.copy2(source, destination)
+        return destination
+    parsed = urlparse(value)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise ValueError(
+            "Attachment is neither a readable server-local file nor an HTTP(S) download URL. "
+            "Reconnect the plugin and attach the file again."
+        )
     total = 0
-    async with _public_client(follow_redirects=True) as client:
-        async with client.stream("GET", url) as response:
+    async with httpx.AsyncClient(timeout=httpx.Timeout(HTTP_TIMEOUT, read=600), follow_redirects=True) as client:
+        async with client.stream("GET", value) as response:
             response.raise_for_status()
-            with temporary.open("wb") as handle:
-                async for chunk in response.aiter_bytes(1024 * 1024):
+            with destination.open("wb") as handle:
+                async for chunk in response.aiter_bytes():
                     total += len(chunk)
-                    if total > MAX_DOWNLOAD_MB * 1024 * 1024:
-                        raise ValueError(f"Download exceeds MAX_DOWNLOAD_MB={MAX_DOWNLOAD_MB}")
+                    if total > MAX_INPUT_BYTES:
+                        raise ValueError(f"Input exceeds MAX_INPUT_BYTES ({MAX_INPUT_BYTES})")
                     handle.write(chunk)
-    temporary.replace(destination)
     return destination
 
 
-def _pipeline_dir(pipeline_id: str) -> Path:
+async def _download_result(url: str, destination: Path) -> Path:
+    return await _materialize_input(url, destination)
+
+
+async def _rh_upload(path: Path, file_type: str) -> str:
+    mime = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+    async with httpx.AsyncClient(timeout=httpx.Timeout(HTTP_TIMEOUT, read=600)) as client:
+        with path.open("rb") as handle:
+            response = await client.post(
+                f"{RH_BASE_URL}/task/openapi/upload",
+                headers=_auth_headers(),
+                data={"apiKey": RH_API_KEY, "fileType": file_type.lower()},
+                files={"file": (path.name, handle, mime)},
+            )
+    payload = _json_response_or_raise(response)
+    if payload.get("code") != 0 or not (payload.get("data") or {}).get("fileName"):
+        raise RuntimeError(f"RunningHub upload failed: {payload}")
+    return str(payload["data"]["fileName"])
+
+
+async def _rh_submit(webapp_id: str, node_info_list: list[dict[str, Any]]) -> str:
+    body = {"webappId": webapp_id, "apiKey": RH_API_KEY, "nodeInfoList": node_info_list}
+    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
+        response = await client.post(
+            f"{RH_BASE_URL}/task/openapi/ai-app/run",
+            headers={**_auth_headers(), "Content-Type": "application/json"},
+            json=body,
+        )
+    payload = _json_response_or_raise(response)
+    task_id = (payload.get("data") or {}).get("taskId")
+    if payload.get("code") != 0 or not task_id:
+        raise RuntimeError(f"RunningHub task submission failed: {payload}")
+    return str(task_id)
+
+
+async def _rh_outputs(task_id: str) -> dict[str, Any]:
+    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
+        response = await client.post(
+            f"{RH_BASE_URL}/task/openapi/outputs",
+            headers={**_auth_headers(), "Content-Type": "application/json"},
+            json={"apiKey": RH_API_KEY, "taskId": task_id},
+        )
+    return _json_response_or_raise(response)
+
+
+def _extract_urls(value: Any) -> list[str]:
+    urls: list[str] = []
+    if isinstance(value, str):
+        if value.startswith(("http://", "https://")):
+            urls.append(value)
+        else:
+            try:
+                urls.extend(_extract_urls(json.loads(value)))
+            except (ValueError, TypeError):
+                pass
+    elif isinstance(value, list):
+        for item in value:
+            urls.extend(_extract_urls(item))
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            if key.lower() in {"url", "fileurl", "file_url", "video_url"} and isinstance(item, str):
+                if item.startswith(("http://", "https://")):
+                    urls.append(item)
+            else:
+                urls.extend(_extract_urls(item))
+    return list(dict.fromkeys(urls))
+
+
+def _task_state(payload: dict[str, Any]) -> tuple[str, list[str], Any]:
+    code = payload.get("code")
+    data = payload.get("data")
+    if code == 0 and data:
+        urls = _extract_urls(data)
+        return "succeeded", urls, None
+    if code == 805:
+        return "failed", [], data or payload.get("msg") or "RunningHub workflow failed"
+    if code in (804, 813) or not data:
+        return "running", [], None
+    return "running", [], None
+
+
+def _run_json(command: list[str]) -> dict[str, Any]:
+    completed = subprocess.run(command, check=True, capture_output=True, text=True)
+    return json.loads(completed.stdout)
+
+
+def _probe_video(path: Path) -> dict[str, Any]:
+    payload = _run_json(
+        [
+            "ffprobe", "-v", "error", "-show_entries",
+            "format=duration:stream=index,codec_type,width,height,avg_frame_rate",
+            "-of", "json", str(path),
+        ]
+    )
+    streams = payload.get("streams") or []
+    video = next((s for s in streams if s.get("codec_type") == "video"), {})
+    fps_text = str(video.get("avg_frame_rate") or "0/1")
     try:
-        normalized = str(uuid.UUID(pipeline_id))
-    except ValueError as exc:
-        raise ValueError("Invalid pipeline_id") from exc
-    path = PIPELINES_DIR / normalized
-    path.mkdir(parents=True, exist_ok=True)
-    return path
-
-
-def _state_path(pipeline_id: str) -> Path:
-    return _pipeline_dir(pipeline_id) / "state.json"
-
-
-def _load_state(pipeline_id: str) -> dict[str, Any]:
-    path = _state_path(pipeline_id)
-    if not path.is_file():
-        raise ValueError(f"Unknown pipeline_id: {pipeline_id}")
-    return json.loads(path.read_text(encoding="utf-8"))
-
-
-def _save_state(state: dict[str, Any]) -> None:
-    state["updated_at"] = time.time()
-    path = _state_path(str(state["pipeline_id"]))
-    temporary = path.with_suffix(".json.tmp")
-    temporary.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
-    temporary.replace(path)
-
-
-def _state_for_user(state: dict[str, Any]) -> dict[str, Any]:
-    keep = {
-        "pipeline_id", "status", "stage", "created_at", "updated_at",
-        "stage1_task_id", "stage2_task_id", "stage1_results", "stage2_results",
-        "stage1_output_index", "stage2_attempts",
-        "final_video_url", "final_runninghub_upload_url", "warning", "error",
-        "preserve_original_audio_and_duration", "source_video_info", "bernini_frame_count",
+        num, den = fps_text.split("/", 1)
+        fps = float(num) / float(den) if float(den) else 0.0
+    except (ValueError, ZeroDivisionError):
+        fps = 0.0
+    return {
+        "duration_seconds": float((payload.get("format") or {}).get("duration") or 0),
+        "fps": fps or 30.0,
+        "width": int(video.get("width") or 0),
+        "height": int(video.get("height") or 0),
+        "has_audio": any(s.get("codec_type") == "audio" for s in streams),
     }
-    result = {key: value for key, value in state.items() if key in keep and value not in (None, "", [])}
-    if state.get("status") in {"stage1_running", "stage2_running"}:
-        result["next_action"] = "Call wait_person_background_replacement or get_person_background_replacement"
+
+
+def _finalize_video(generated: Path, source: Path, output: Path, preserve: bool) -> dict[str, Any]:
+    source_info = _probe_video(source)
+    if not preserve:
+        shutil.copy2(generated, output)
+        return _probe_video(output)
+    generated_info = _probe_video(generated)
+    target = source_info["duration_seconds"]
+    current = generated_info["duration_seconds"]
+    if target <= 0 or current <= 0:
+        raise RuntimeError("Cannot determine source or generated video duration")
+    ratio = target / current
+    vf = f"setpts={ratio:.12f}*PTS,fps={source_info['fps']:.8f},format=yuv420p"
+    command = [
+        "ffmpeg", "-y", "-i", str(generated), "-i", str(source),
+        "-filter:v", vf, "-map", "0:v:0", "-map", "1:a:0?",
+        "-t", f"{target:.9f}", "-c:v", "libx264", "-preset", "fast", "-crf", "18",
+        "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", str(output),
+    ]
+    completed = subprocess.run(command, capture_output=True, text=True)
+    if completed.returncode != 0:
+        raise RuntimeError("FFmpeg finalization failed: " + completed.stderr[-2000:])
+    final_info = _probe_video(output)
+    final_info["source_duration_seconds"] = target
+    final_info["duration_delta_seconds"] = final_info["duration_seconds"] - target
+    return final_info
+
+
+def _public_result(item: dict[str, Any]) -> dict[str, Any]:
+    hidden = {"job_dir", "source_video_path", "background_image_path", "download_token"}
+    result = {k: v for k, v in item.items() if k not in hidden}
+    if item.get("status") == "completed" and item.get("download_token"):
+        base = PUBLIC_BASE_URL or ""
+        path = f"/files/{item['pipeline_id']}.mp4?token={item['download_token']}"
+        result["final_video_url"] = base + path if base else path
     return result
 
 
-def _active_pipeline() -> dict[str, Any] | None:
-    for path in sorted(PIPELINES_DIR.glob("*/state.json"), reverse=True):
-        try:
-            state = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            continue
-        if state.get("status") in {
-            "receiving_inputs", "uploading", "stage1_running", "stage2_running", "stage2_preparing"
-        }:
-            return state
-    return None
-
-
-def _ffprobe_duration(path: Path) -> float:
-    duration = float(_ffprobe_video_info(path)["duration_seconds"])
-    if duration <= 0:
-        raise ValueError("Source video has no positive duration")
-    return duration
-
-
-def _ffprobe_video_info(path: Path) -> dict[str, Any]:
-    command = [
-        "ffprobe", "-v", "error", "-select_streams", "v:0",
-        "-show_entries", "stream=avg_frame_rate,r_frame_rate,nb_frames,duration:format=duration",
-        "-of", "json", str(path),
+async def _submit_vace(item: dict[str, Any], stage1_url: str) -> dict[str, Any]:
+    job_dir = Path(item["job_dir"])
+    stage1_path = job_dir / "stage1.mp4"
+    await _download_result(stage1_url, stage1_path)
+    stage1_upload = await _rh_upload(stage1_path, "video")
+    background_upload = await _rh_upload(Path(item["background_image_path"]), "image")
+    nodes = await _api_call_demo(VACE_WEBAPP_ID)
+    resolved = _resolve_vace(nodes)
+    node_info = [
+        _override(resolved["source_video"], "VACE_SOURCE_VIDEO", stage1_upload),
+        _override(resolved["background_image"], "VACE_BACKGROUND_IMAGE", background_upload),
+        _override(resolved["prompt"], "VACE_PROMPT", item["stage2_prompt"]),
     ]
-    payload = json.loads(subprocess.check_output(command, text=True, timeout=30))
-    streams = payload.get("streams") or []
-    if not streams:
-        raise ValueError("Source file contains no video stream")
-    stream = streams[0]
-    duration = float(stream.get("duration") or payload.get("format", {}).get("duration") or 0)
-    rate_text = str(stream.get("avg_frame_rate") or stream.get("r_frame_rate") or "0/1")
-    try:
-        fps = float(Fraction(rate_text))
-    except (ValueError, ZeroDivisionError):
-        fps = 0.0
-    raw_frames = stream.get("nb_frames")
-    frame_count = int(raw_frames) if str(raw_frames or "").isdigit() else round(duration * fps)
-    if duration <= 0 or fps <= 0 or frame_count <= 0:
-        raise ValueError(
-            f"Unable to determine video timing: duration={duration}, fps={fps}, frames={frame_count}"
-        )
-    return {
-        "duration_seconds": duration,
-        "fps": fps,
-        "frame_count": frame_count,
-    }
+    if resolved.get("frame_count") and item.get("vace_frame_count"):
+        node_info.append(_override(resolved["frame_count"], "VACE_FRAME_COUNT", item["vace_frame_count"]))
+    task_id = await _rh_submit(VACE_WEBAPP_ID, node_info)
+    item.update({"stage": 2, "status": "stage2_running", "stage2_task_id": task_id, "stage1_selected_url": stage1_url})
+    await _save_pipeline(item)
+    return item
 
 
-def _bernini_frame_count(source_frame_count: int) -> int:
-    capped = min(max(1, source_frame_count), BERNINI_MAX_FRAMES)
-    if BERNINI_FRAME_MULTIPLE == 1:
-        return capped
-    candidate = capped - ((capped - BERNINI_FRAME_OFFSET) % BERNINI_FRAME_MULTIPLE)
-    if candidate <= 0:
-        candidate = min(capped, max(1, BERNINI_FRAME_OFFSET))
-    return candidate
+async def _advance(item: dict[str, Any]) -> dict[str, Any]:
+    if item["status"] == "stage1_running":
+        payload = await _rh_outputs(item["stage1_task_id"])
+        status, urls, error = _task_state(payload)
+        if status == "failed":
+            item.update({"status": "stage1_failed", "error": error})
+            await _save_pipeline(item)
+        elif status == "succeeded":
+            videos = [u for u in urls if ".mp4" in u.lower()] or urls
+            item["stage1_results"] = videos
+            index = int(item.get("stage1_output_index", 0))
+            if not videos or index >= len(videos):
+                item.update({"status": "stage1_failed", "error": f"No stage-1 video at index {index}"})
+                await _save_pipeline(item)
+            else:
+                item = await _submit_vace(item, videos[index])
+    if item["status"] == "stage2_running":
+        payload = await _rh_outputs(item["stage2_task_id"])
+        status, urls, error = _task_state(payload)
+        if status == "failed":
+            item.update({"status": "stage2_failed", "error": error})
+            await _save_pipeline(item)
+        elif status == "succeeded":
+            videos = [u for u in urls if ".mp4" in u.lower()] or urls
+            if not videos:
+                item.update({"status": "stage2_failed", "error": "VACE returned no video URL"})
+                await _save_pipeline(item)
+            else:
+                job_dir = Path(item["job_dir"])
+                raw_path = job_dir / "stage2_raw.mp4"
+                final_path = job_dir / "final.mp4"
+                await _download_result(videos[0], raw_path)
+                final_info = await asyncio.to_thread(
+                    _finalize_video,
+                    raw_path,
+                    Path(item["source_video_path"]),
+                    final_path,
+                    bool(item["preserve_original_audio_and_duration"]),
+                )
+                item.update({
+                    "status": "completed", "stage": 3, "stage2_results": videos,
+                    "final_video_info": final_info, "download_token": secrets.token_urlsafe(24),
+                })
+                await _save_pipeline(item)
+    return item
 
 
-def _restore_audio_and_duration(raw_video: Path, source_video: Path, output: Path) -> None:
-    duration = _ffprobe_duration(source_video)
-    command = [
-        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-        "-i", str(raw_video), "-i", str(source_video),
-        "-filter_complex", f"[0:v]tpad=stop_mode=clone:stop_duration={duration:.6f}[v]",
-        "-map", "[v]", "-map", "1:a:0?", "-t", f"{duration:.6f}",
-        "-c:v", "libx264", "-preset", "medium", "-crf", "18",
-        "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k",
-        "-movflags", "+faststart", str(output),
-    ]
-    subprocess.run(command, check=True, timeout=1800)
-
-
-async def _finalize_stage2(state: dict[str, Any], videos: list[dict[str, Any]]) -> dict[str, Any]:
-    state["stage2_results"] = videos
-    state["status"] = "completed"
-    state["stage"] = 2
-    state["final_video_url"] = videos[0]["url"]
-    if not state.get("preserve_original_audio_and_duration"):
-        _save_state(state)
-        return state
-
-    pipeline_dir = _pipeline_dir(state["pipeline_id"])
-    source_video = pipeline_dir / str(state.get("source_original_name", "source_original.mp4"))
-    raw_video = pipeline_dir / "stage2_raw.mp4"
-    final_video = pipeline_dir / "final.mp4"
-    try:
-        await _download(videos[0]["url"], raw_video)
-        await asyncio.to_thread(_restore_audio_and_duration, raw_video, source_video, final_video)
-        uploaded = await _upload_file(final_video)
-        state["final_runninghub_upload_url"] = uploaded.get("download_url")
-        if PUBLIC_BASE_URL:
-            state["final_video_url"] = f"{PUBLIC_BASE_URL}/files/{state['pipeline_id']}/final.mp4"
-        elif uploaded.get("download_url"):
-            state["final_video_url"] = uploaded["download_url"]
-        else:
-            state["warning"] = "Final video is stored locally; set PUBLIC_BASE_URL to expose it"
-    except Exception as exc:  # Preserve the successful Bernini output on post-processing failure.
-        state["warning"] = f"Background replacement succeeded, but final audio/duration restoration failed: {exc}"
-    finally:
-        if raw_video.exists() and not KEEP_INTERMEDIATE_FILES:
-            raw_video.unlink(missing_ok=True)
-    _save_state(state)
-    return state
-
-
-async def _submit_stage2_from_existing_results(
-    state: dict[str, Any],
-    output_index: int,
-) -> dict[str, Any]:
-    """Submit only Bernini-R using a stored successful SCAIL output."""
-
-    videos = state.get("stage1_results")
-    if not isinstance(videos, list) or not videos:
-        raise ValueError("This pipeline has no successful SCAIL video to reuse")
-    if output_index < 0 or output_index >= len(videos):
-        raise ValueError(
-            f"stage1_output_index={output_index}, but SCAIL returned {len(videos)} video(s)"
-        )
-    background_file_name = str(state.get("background_upload_file_name") or "").strip()
-    if not background_file_name:
-        raise ValueError("This pipeline has no uploaded background image to reuse")
-
-    state.update(
-        status="stage2_preparing",
-        stage=2,
-        stage1_output_index=output_index,
+@mcp.tool()
+async def inspect_scail_vace_pipeline(force_refresh: bool = False) -> dict[str, Any]:
+    """Read-only inspection of SCAIL-2 and Wan2.2 VACE nodes. Does not create tasks or consume RH."""
+    scail_nodes, vace_nodes = await asyncio.gather(
+        _api_call_demo(SCAIL_WEBAPP_ID, force_refresh),
+        _api_call_demo(VACE_WEBAPP_ID, force_refresh),
     )
-    _save_state(state)
-
-    pipeline_dir = _pipeline_dir(state["pipeline_id"])
-    stage1_video = pipeline_dir / f"stage1-retry-{output_index}.mp4"
-    try:
-        await _download(str(videos[output_index]["url"]), stage1_video)
-        stage1_upload = await _upload_file(stage1_video)
-        nodes = await _get_nodes(BERNINI_WEBAPP_ID)
-        mapping = _resolve_stage2(nodes)
-        overrides = [
-            _override(mapping["source_video"], stage1_upload["fileName"]),
-            _override(mapping["background_image"], background_file_name),
-        ]
-        if mapping["prompt"] is not None:
-            overrides.append(_override(mapping["prompt"], state["stage2_prompt"]))
-        if mapping["frame_count"] is not None and state.get("bernini_frame_count") is not None:
-            overrides.append(
-                _override(mapping["frame_count"], str(state["bernini_frame_count"]))
-            )
-        submitted = await _submit_app(BERNINI_WEBAPP_ID, overrides)
-        state.update(
-            status="stage2_running",
-            stage=2,
-            stage2_task_id=submitted["task_id"],
-        )
-        _save_state(state)
-    except Exception as exc:
-        state.update(status="stage2_failed", error=f"Unable to submit Bernini stage: {exc}")
-        _save_state(state)
-    finally:
-        if stage1_video.exists() and not KEEP_INTERMEDIATE_FILES:
-            stage1_video.unlink(missing_ok=True)
-    return state
-
-
-async def _advance_pipeline(state: dict[str, Any]) -> dict[str, Any]:
-    status = state.get("status")
-    if status == "stage1_running":
-        query = await _query_task(state["stage1_task_id"])
-        remote_status = query["status"]
-        if remote_status in {"FAILED", "ERROR", "CANCELLED", "CANCELED"}:
-            state.update(status="stage1_failed", error=query.get("error") or query.get("raw"))
-            _save_state(state)
-            return state
-        if remote_status != "SUCCESS":
-            return state
-        videos = _video_results(query.get("results"))
-        if not videos:
-            state.update(status="stage1_failed", error="SCAIL task succeeded but returned no video")
-            _save_state(state)
-            return state
-        state["stage1_results"] = videos
-        output_index = int(state.get("stage1_output_index", 0))
-        if output_index >= len(videos):
-            state.update(
-                status="stage1_failed",
-                error=f"stage1_output_index={output_index}, but SCAIL returned {len(videos)} video(s)",
-            )
-            _save_state(state)
-            return state
-        return await _submit_stage2_from_existing_results(state, output_index)
-
-    if status == "stage2_running":
-        query = await _query_task(state["stage2_task_id"])
-        remote_status = query["status"]
-        if remote_status in {"FAILED", "ERROR", "CANCELLED", "CANCELED"}:
-            state.update(status="stage2_failed", error=query.get("error") or query.get("raw"))
-            _save_state(state)
-            return state
-        if remote_status != "SUCCESS":
-            return state
-        videos = _video_results(query.get("results"))
-        if not videos:
-            state.update(status="stage2_failed", error="Bernini task succeeded but returned no video")
-            _save_state(state)
-            return state
-        return await _finalize_stage2(state, videos)
-    return state
-
-
-@mcp.custom_route("/health", methods=["GET"])
-async def health(_: Request) -> JSONResponse:
-    return JSONResponse(
-        {
-            "ok": True,
-            "service": "runninghub-person-background-mcp",
-            "api_key_configured": bool(RUNNINGHUB_API_KEY),
-            "scail_webapp_id": SCAIL_WEBAPP_ID,
-            "bernini_webapp_id": BERNINI_WEBAPP_ID,
-        }
-    )
-
-
-@mcp.custom_route("/files/{pipeline_id}/final.mp4", methods=["GET"])
-async def serve_final(request: Request) -> FileResponse | JSONResponse:
-    pipeline_id = request.path_params["pipeline_id"]
-    try:
-        path = _pipeline_dir(pipeline_id) / "final.mp4"
-    except ValueError:
-        return JSONResponse({"error": "invalid pipeline id"}, status_code=404)
-    if not path.is_file():
-        return JSONResponse({"error": "final video not found"}, status_code=404)
-    return FileResponse(path, media_type="video/mp4", filename=f"{pipeline_id}-final.mp4")
-
-
-@mcp.tool(
-    description=(
-        "只读检查 SCAIL 与 Bernini-R 两个 RunningHub 应用的可调用节点和自动映射结果。"
-        "不会创建任务或消耗 RH。部署后应先调用一次。"
-    )
-)
-async def inspect_person_background_pipeline(force_refresh: bool = False) -> dict[str, Any]:
-    stage1_nodes, stage2_nodes = await asyncio.gather(
-        _get_nodes(SCAIL_WEBAPP_ID, force_refresh),
-        _get_nodes(BERNINI_WEBAPP_ID, force_refresh),
-    )
-    stage1 = _resolve_stage1(stage1_nodes)
-    stage2 = _resolve_stage2(stage2_nodes)
     return {
         "connected": True,
         "rh_charge": False,
-        "stage1": {
-            "webapp_id": SCAIL_WEBAPP_ID,
-            "resolved": {key: _public_node(value) for key, value in stage1.items()},
-            "all_nodes": [_public_node(node) for node in stage1_nodes],
-        },
-        "stage2": {
-            "webapp_id": BERNINI_WEBAPP_ID,
-            "resolved": {key: _public_node(value) for key, value in stage2.items()},
-            "all_nodes": [_public_node(node) for node in stage2_nodes],
-        },
+        "stage1": {"webapp_id": SCAIL_WEBAPP_ID, "resolved": _resolve_scail(scail_nodes), "all_nodes": scail_nodes},
+        "stage2": {"webapp_id": VACE_WEBAPP_ID, "resolved": _resolve_vace(vace_nodes), "all_nodes": vace_nodes},
     }
 
 
-@mcp.tool(
-    meta={
-        "openai/fileParams": [
-            "reference_person_image_file",
-            "source_video_file",
-            "background_image_file",
-        ]
-    },
-    annotations={
-        "readOnlyHint": False,
-        "destructiveHint": False,
-        "idempotentHint": False,
-        "openWorldHint": True,
-    },
-    description=(
-        "直接使用 ChatGPT 的人物参考图、原视频和背景图附件启动两阶段替换任务。"
-        "ChatGPT 会把附件的临时下载地址安全传给 Railway，Railway 不再读取 ChatGPT 本地路径。"
-        "第一阶段 SCAIL 换人，成功后自动由 Bernini-R 换背景；会消耗两次 RunningHub RH，"
-        "必须显式确认 confirm_rh_charge=true。服务器会自动读取原视频帧数并设置 Bernini 总帧数。"
-    )
-)
-async def submit_person_background_replacement_from_chatgpt_attachments(
-    reference_person_image_file: OpenAIFile,
-    source_video_file: OpenAIFile,
-    background_image_file: OpenAIFile,
-    confirm_rh_charge: Annotated[
-        bool,
-        Field(description="必须为 true，确认同意 SCAIL 与 Bernini-R 两阶段均会消耗 RH"),
-    ],
-    stage1_prompt: str = DEFAULT_STAGE1_PROMPT,
-    stage2_prompt: str = DEFAULT_STAGE2_PROMPT,
-    stage1_output_index: Annotated[int, Field(ge=0, le=10)] = 0,
+@mcp.tool()
+async def submit_scail_vace_replacement_from_chatgpt_attachments(
+    reference_person_and_background_image_file: str,
+    source_video_file: str,
+    confirm_rh_charge: bool,
     preserve_original_audio_and_duration: bool = True,
+    stage1_prompt: str = "使用参考图片中的人物替换原视频人物，保持动作、姿态、镜头和节奏一致。",
+    stage2_prompt: str = "将视频背景完整替换为参考图片中的场景，保持人物、动作、镜头构图和节奏不变，光影自然融合。",
+    stage1_output_index: int = 0,
+    vace_frame_count: int | None = None,
 ) -> dict[str, Any]:
-    if not confirm_rh_charge:
-        raise ValueError("RH charge was not confirmed; set confirm_rh_charge=true to submit")
-    _require_api_key()
-    if not ALLOW_CONCURRENT_PIPELINES:
-        active = _active_pipeline()
-        if active:
-            raise RuntimeError(
-                f"Pipeline {active['pipeline_id']} is still active ({active['status']}). "
-                "Finish/query it before starting another, or set ALLOW_CONCURRENT_PIPELINES=true."
-            )
+    """Start SCAIL person replacement followed automatically by Wan2.2 VACE background replacement.
 
+    The two file parameters accept a ChatGPT attachment passed as a readable server-local path or HTTP(S)
+    temporary download URL. This operation consumes one SCAIL RH task and one VACE RH task, so
+    confirm_rh_charge must be true.
+    """
+    if not confirm_rh_charge:
+        raise ValueError("Set confirm_rh_charge=true only after the user explicitly confirms two RH tasks")
+    if stage1_output_index < 0:
+        raise ValueError("stage1_output_index must be 0 or greater")
+    _require_config()
     pipeline_id = str(uuid.uuid4())
-    pipeline_dir = _pipeline_dir(pipeline_id)
-    state: dict[str, Any] = {
+    job_dir = JOBS_DIR / pipeline_id
+    job_dir.mkdir(parents=True, exist_ok=False)
+    source_path = await _materialize_input(source_video_file, job_dir / "source.mp4")
+    image_suffix = Path(urlparse(reference_person_and_background_image_file).path).suffix.lower()
+    if image_suffix not in {".jpg", ".jpeg", ".png", ".webp"}:
+        image_suffix = ".jpg"
+    image_path = await _materialize_input(
+        reference_person_and_background_image_file, job_dir / f"reference{image_suffix}"
+    )
+    source_info = await asyncio.to_thread(_probe_video, source_path)
+    person_upload, video_upload = await asyncio.gather(
+        _rh_upload(image_path, "image"), _rh_upload(source_path, "video")
+    )
+    nodes = await _api_call_demo(SCAIL_WEBAPP_ID)
+    resolved = _resolve_scail(nodes)
+    node_info = [
+        _override(resolved["person_image"], "SCAIL_PERSON_IMAGE", person_upload),
+        _override(resolved["source_video"], "SCAIL_SOURCE_VIDEO", video_upload),
+        _override(resolved["prompt"], "SCAIL_PROMPT", stage1_prompt),
+    ]
+    task_id = await _rh_submit(SCAIL_WEBAPP_ID, node_info)
+    item: dict[str, Any] = {
         "pipeline_id": pipeline_id,
-        "status": "receiving_inputs",
+        "status": "stage1_running",
         "stage": 1,
         "created_at": time.time(),
         "updated_at": time.time(),
-        "stage1_prompt": stage1_prompt,
-        "stage2_prompt": stage2_prompt,
+        "stage1_task_id": task_id,
         "stage1_output_index": stage1_output_index,
         "preserve_original_audio_and_duration": preserve_original_audio_and_duration,
+        "source_video_info": source_info,
+        "stage1_prompt": stage1_prompt,
+        "stage2_prompt": stage2_prompt,
+        "vace_frame_count": vace_frame_count,
+        "job_dir": str(job_dir),
+        "source_video_path": str(source_path),
+        "background_image_path": str(image_path),
     }
-    _save_state(state)
-
-    try:
-        person, source, background = await asyncio.gather(
-            _ingest_input(reference_person_image_file, pipeline_dir / "person_reference", IMAGE_SUFFIXES),
-            _ingest_input(source_video_file, pipeline_dir / "source_original", VIDEO_SUFFIXES),
-            _ingest_input(background_image_file, pipeline_dir / "background_reference", IMAGE_SUFFIXES),
-        )
-        source_info = await asyncio.to_thread(_ffprobe_video_info, source)
-        frame_count = _bernini_frame_count(int(source_info["frame_count"]))
-        state.update(
-            status="uploading",
-            source_original_name=source.name,
-            source_video_info=source_info,
-            bernini_frame_count=frame_count,
-        )
-        _save_state(state)
-        person_upload, source_upload, background_upload = await asyncio.gather(
-            _upload_file(person), _upload_file(source), _upload_file(background)
-        )
-        nodes = await _get_nodes(SCAIL_WEBAPP_ID)
-        mapping = _resolve_stage1(nodes)
-        overrides = [
-            _override(mapping["person_image"], person_upload["fileName"]),
-            _override(mapping["source_video"], source_upload["fileName"]),
-        ]
-        if mapping["prompt"] is not None:
-            overrides.append(_override(mapping["prompt"], stage1_prompt))
-        submitted = await _submit_app(SCAIL_WEBAPP_ID, overrides)
-        state.update(
-            status="stage1_running",
-            stage1_task_id=submitted["task_id"],
-            background_upload_file_name=background_upload["fileName"],
-        )
-        _save_state(state)
-        return _state_for_user(state)
-    except Exception as exc:
-        state.update(status="stage1_failed", error=str(exc))
-        _save_state(state)
-        raise
+    await _save_pipeline(item)
+    return _public_result(item)
 
 
-finalize_openai_file_param_schema(
-    "submit_person_background_replacement_from_chatgpt_attachments",
-    "reference_person_image_file",
-    "source_video_file",
-    "background_image_file",
-)
+@mcp.tool()
+async def get_scail_vace_replacement(pipeline_id: str) -> dict[str, Any]:
+    """Query and advance one pipeline. Completed responses include a tokenized final video URL."""
+    _safe_pipeline_id(pipeline_id)
+    item = await _get_pipeline(pipeline_id)
+    if item["status"] in {"stage1_running", "stage2_running"}:
+        item = await _advance(item)
+    return _public_result(item)
 
 
-@mcp.tool(
-    description=(
-        "查询并推进两阶段换人换背景任务。SCAIL 成功后会使用已授权的 RH 自动提交 Bernini-R；"
-        "最终返回背景替换视频链接。"
-    )
-)
-async def get_person_background_replacement(pipeline_id: str) -> dict[str, Any]:
-    async with _state_lock:
-        state = _load_state(pipeline_id)
-        state = await _advance_pipeline(state)
-        return _state_for_user(state)
-
-
-@mcp.tool(
-    description=(
-        "仅重试失败流水线的 Bernini-R 背景替换阶段。复用已经成功的 SCAIL 人物视频和背景图，"
-        "不会重新运行或扣费 SCAIL；会消耗一次新的 Bernini-R RH，必须显式确认 "
-        "confirm_rh_charge=true。stage1_output_index=-1 时自动改用下一条 SCAIL 候选视频。"
-    ),
-    annotations={
-        "readOnlyHint": False,
-        "destructiveHint": False,
-        "idempotentHint": False,
-        "openWorldHint": True,
-    },
-)
-async def retry_background_replacement_only(
+@mcp.tool()
+async def wait_scail_vace_replacement(
     pipeline_id: str,
-    confirm_rh_charge: Annotated[
-        bool,
-        Field(description="必须为 true，确认本次仅重新消耗一次 Bernini-R RH"),
-    ],
-    stage1_output_index: Annotated[int, Field(ge=-1, le=10)] = -1,
-    bernini_frame_count: Annotated[int, Field(ge=0, le=4097)] = 0,
-    stage2_prompt: str = "",
+    timeout_seconds: int = 300,
+    poll_interval_seconds: int = 10,
 ) -> dict[str, Any]:
-    if not confirm_rh_charge:
-        raise ValueError("RH charge was not confirmed; set confirm_rh_charge=true to retry")
-    _require_api_key()
-
-    async with _state_lock:
-        state = _load_state(pipeline_id)
-        if state.get("status") != "stage2_failed":
-            raise ValueError(
-                "Only a pipeline with status=stage2_failed can retry the background stage"
-            )
-        videos = state.get("stage1_results")
-        if not isinstance(videos, list) or not videos:
-            raise ValueError("This pipeline has no successful SCAIL video to reuse")
-
-        if stage1_output_index == -1:
-            previous_index = int(state.get("stage1_output_index", 0))
-            selected_index = (previous_index + 1) % len(videos)
-        else:
-            selected_index = stage1_output_index
-        if selected_index >= len(videos):
-            raise ValueError(
-                f"stage1_output_index={selected_index}, but SCAIL returned {len(videos)} video(s)"
-            )
-
-        attempts = state.setdefault("stage2_attempts", [])
-        attempts.append(
-            {
-                "task_id": state.get("stage2_task_id"),
-                "status": state.get("status"),
-                "error": state.get("error"),
-                "stage1_output_index": state.get("stage1_output_index", 0),
-                "ended_at": time.time(),
-            }
-        )
-        if stage2_prompt.strip():
-            state["stage2_prompt"] = stage2_prompt.strip()
-        if bernini_frame_count > 0:
-            state["bernini_frame_count"] = _bernini_frame_count(bernini_frame_count)
-        for key in (
-            "stage2_results",
-            "final_video_url",
-            "final_runninghub_upload_url",
-            "warning",
-            "error",
-        ):
-            state.pop(key, None)
-
-        state = await _submit_stage2_from_existing_results(state, selected_index)
-        return _state_for_user(state)
-
-
-@mcp.tool(
-    description=(
-        "等待两阶段换人换背景任务完成。最长可等待 900 秒；超时会返回 pipeline_id，之后可继续调用。"
-    )
-)
-async def wait_person_background_replacement(
-    pipeline_id: str,
-    timeout_seconds: Annotated[int, Field(ge=10, le=900)] = 900,
-    poll_interval_seconds: Annotated[int, Field(ge=5, le=60)] = 20,
-) -> dict[str, Any]:
+    """Wait for a pipeline for up to 900 seconds. A timeout does not cancel the RunningHub tasks."""
+    _safe_pipeline_id(pipeline_id)
+    timeout_seconds = max(1, min(timeout_seconds, 900))
+    poll_interval_seconds = max(3, min(poll_interval_seconds, 60))
     deadline = time.monotonic() + timeout_seconds
-    terminal = {"completed", "stage1_failed", "stage2_failed"}
-    while time.monotonic() < deadline:
-        async with _state_lock:
-            state = _load_state(pipeline_id)
-            state = await _advance_pipeline(state)
-        if state.get("status") in terminal:
-            return _state_for_user(state)
+    while True:
+        item = await _get_pipeline(pipeline_id)
+        if item["status"] in {"stage1_running", "stage2_running"}:
+            item = await _advance(item)
+        if item["status"] not in {"stage1_running", "stage2_running"}:
+            return _public_result(item)
+        if time.monotonic() >= deadline:
+            result = _public_result(item)
+            result["wait_timed_out"] = True
+            return result
         await asyncio.sleep(poll_interval_seconds)
-    state = _load_state(pipeline_id)
-    result = _state_for_user(state)
-    result["wait_timed_out"] = True
-    return result
 
 
-@mcp.tool(description="列出 Railway Volume 中最近的换人换背景任务；不会消耗 RH。")
-async def list_person_background_replacements(limit: Annotated[int, Field(ge=1, le=100)] = 20) -> list[dict[str, Any]]:
-    states: list[dict[str, Any]] = []
-    for path in PIPELINES_DIR.glob("*/state.json"):
-        try:
-            states.append(json.loads(path.read_text(encoding="utf-8")))
-        except (OSError, json.JSONDecodeError):
-            continue
-    states.sort(key=lambda item: item.get("updated_at", 0), reverse=True)
-    return [_state_for_user(state) for state in states[:limit]]
+@mcp.tool()
+async def retry_vace_background_only(
+    pipeline_id: str,
+    confirm_rh_charge: bool,
+    stage1_output_index: int | None = None,
+    stage2_prompt: str | None = None,
+    vace_frame_count: int | None = None,
+) -> dict[str, Any]:
+    """Retry only Wan2.2 VACE, reusing a successful SCAIL video. Consumes one additional VACE RH task."""
+    if not confirm_rh_charge:
+        raise ValueError("Set confirm_rh_charge=true only after explicit confirmation of one VACE RH task")
+    _safe_pipeline_id(pipeline_id)
+    item = await _get_pipeline(pipeline_id)
+    videos = item.get("stage1_results") or []
+    if not videos:
+        raise ValueError("This pipeline has no successful SCAIL result to reuse")
+    index = int(item.get("stage1_output_index", 0) if stage1_output_index is None else stage1_output_index)
+    if index < 0 or index >= len(videos):
+        raise ValueError(f"stage1_output_index must be between 0 and {len(videos) - 1}")
+    if stage2_prompt:
+        item["stage2_prompt"] = stage2_prompt
+    if vace_frame_count is not None:
+        item["vace_frame_count"] = vace_frame_count
+    item["stage1_output_index"] = index
+    attempts = item.setdefault("stage2_attempts", [])
+    if item.get("stage2_task_id"):
+        attempts.append({"task_id": item["stage2_task_id"], "status": item.get("status"), "error": item.get("error")})
+    item.pop("error", None)
+    item = await _submit_vace(item, videos[index])
+    return _public_result(item)
 
 
-def main() -> None:
-    port = int(os.getenv("PORT", "8000"))
-    mcp.run(transport="http", host="0.0.0.0", port=port, path="/mcp")
+@mcp.tool()
+async def list_scail_vace_replacements(limit: int = 20) -> list[dict[str, Any]]:
+    """List recent local pipeline records without consuming RH."""
+    limit = max(1, min(limit, 100))
+    async with _state_lock:
+        items = list(_read_state_unlocked().values())
+    items.sort(key=lambda x: x.get("created_at", 0), reverse=True)
+    return [_public_result(item) for item in items[:limit]]
 
 
-if __name__ == "__main__":
-    main()
+@mcp.custom_route("/health", methods=["GET"])
+async def health(_: Request) -> Response:
+    return JSONResponse({"status": "ok", "service": "scail-vace-mcp"})
+
+
+@mcp.custom_route("/files/{pipeline_id}.mp4", methods=["GET"])
+async def download_final(request: Request) -> Response:
+    pipeline_id = _safe_pipeline_id(request.path_params["pipeline_id"])
+    try:
+        item = await _get_pipeline(pipeline_id)
+    except ValueError:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    if request.query_params.get("token") != item.get("download_token"):
+        return JSONResponse({"error": "forbidden"}, status_code=403)
+    path = Path(item.get("job_dir", "")) / "final.mp4"
+    if item.get("status") != "completed" or not path.is_file():
+        return JSONResponse({"error": "not ready"}, status_code=404)
+    return FileResponse(path, media_type="video/mp4", filename=f"{pipeline_id}.mp4")
+
+
+app = mcp.streamable_http_app()

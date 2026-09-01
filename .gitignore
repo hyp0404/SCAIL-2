@@ -1,8 +1,8 @@
 .env
-.venv/
 __pycache__/
 *.py[cod]
-*.log
-data/
 .pytest_cache/
+.venv/
+data/
+*.zip
 

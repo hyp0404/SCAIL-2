@@ -1,11 +1,10 @@
 .git
 .gitignore
 .env
-.venv
-__pycache__
+__pycache__/
 *.py[cod]
-*.log
-data
-tests
-README.md
+.pytest_cache/
+.venv/
+data/
+*.zip
 
